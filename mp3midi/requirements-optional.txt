@@ -1,0 +1,20 @@
+# 「音频转 MIDI」的可选后端。本体（兜底 YIN）只要 numpy + scipy + soundfile + mido。
+#
+# 推荐：basic-pitch（Spotify 的开源转写模型）—— 有伴奏、有编曲也认得出主旋律。
+# 它的依赖里写的 tensorflow 只有 3.12 以下、走 TF 模型时才用得上；3.12 用 ONNX 推理，
+# 所以用 --no-deps 装它本体，再单独装下面这些纯 Python 依赖就行。
+#
+#   pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --no-deps basic-pitch
+#   pip install -i https://pypi.tuna.tsinghua.edu.cn/simple librosa pretty_midi mir_eval resampy scikit-learn
+#
+# （onnxruntime 是推理引擎，没装的话 pip install onnxruntime）
+
+basic-pitch      # Spotify 的多声部转写 + 主旋律提取（ONNX 推理，约 1 MB + onnxruntime）
+librosa          # pyin：逐帧估基频，独奏 / 清唱更稳（约 100 MB，basic-pitch 也要它）
+pretty_midi      # basic-pitch 写 MIDI 用
+mir_eval         # basic-pitch 算转写指标用（它 import 时就要求有）
+resampy          # 重采样（basic-pitch 指定 <0.4.3）
+scikit-learn     # basic-pitch 的模型后处理
+onnxruntime      # ONNX 推理引擎（约 45 MB）
+
+# demucs        # 先分轨（人声 / 伴奏）再转，鼓和贝斯特别重的歌可以再叠一层（带 PyTorch，约 2 GB）
