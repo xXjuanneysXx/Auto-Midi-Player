@@ -18,6 +18,10 @@
     3. PyInstaller 打安装程序本体（--onefile）-> dist_installer\\；
     4. 每个版本各压一个 payload.zip，追加到安装程序 exe 末尾，再补 16 字节尾巴
        （魔数 + 偏移），产物放 发布\\，两个包大小明显不一样。
+
+第 3 步顺手也把卸载程序打出来（uninstall.py -> dist_installer\\uninstall.exe）：
+它跟着 payload 装到安装目录根上，用户从「设置 → 应用」点卸载走的就是它，
+不再是以前那份当场生成的「卸载.bat」。
 """
 
 import io
@@ -42,6 +46,8 @@ APP_DIR = os.path.join(EDITIONS[0]['dist'], 'AutoPlay')
 ICON = os.path.join(HERE, 'AutoPlay.ico')
 INSTALLER_DIST = os.path.join(HERE, 'dist_installer')
 INSTALLER_EXE = os.path.join(INSTALLER_DIST, 'AutoPlay-安装程序.exe')
+UNINSTALLER_EXE = os.path.join(INSTALLER_DIST, 'uninstall.exe')
+UPDATER_EXE = os.path.join(INSTALLER_DIST, 'AutoPlayUpdater.exe')
 RELEASE_DIR = os.path.join(HERE, '发布')
 PAYLOAD_MAGIC = b'APAYLOAD1'
 TRAILER_SIZE = len(PAYLOAD_MAGIC) + 8
@@ -49,6 +55,61 @@ TRAILER_SIZE = len(PAYLOAD_MAGIC) + 8
 
 def log(text):
     print(text, flush=True)
+
+
+def file_sha256(path):
+    """算一个文件的 sha256（给「这个小 exe 能不能沿用上次那份」用）。"""
+    import hashlib
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        while True:
+            chunk = handle.read(1 << 20)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def stamp_path(name):
+    return os.path.join(HERE, 'build_installer', '%s.stamp.json' % name)
+
+
+def can_reuse(name, sources, exe):
+    """
+    「上次打的这个小 exe」能不能接着用？
+
+    为什么要这一手：PyInstaller 每次打出来的字节都不一样（里面带着打包时间之类），
+    哪怕源码一个字没改，重新打一遍 sha256 也变了 —— 增量更新一比，就会发现
+    `uninstall.exe` / `AutoPlayUpdater.exe`「变了」，每次发版白送十几 MB 差分包。
+    源码（和图标）没变就直接沿用上次那个，差分包里就只剩真正改过的东西。
+    """
+    import json
+    stamp = stamp_path(name)
+    if not os.path.isfile(exe):
+        return False
+    try:
+        with open(stamp, encoding='utf-8') as handle:
+            saved = json.load(handle)
+    except (OSError, ValueError):
+        return False
+    now = dict((os.path.basename(path), file_sha256(path)) for path in sources)
+    if saved.get('sources') != now:
+        return False
+    if saved.get('exe') != file_sha256(exe):
+        return False
+    log('%s 的源码没变，沿用上次打好的那份（省一次重打，也省十几 MB 增量包）' % name)
+    return True
+
+
+def remember_build(name, sources, exe):
+    """记下「这个小 exe 是拿这些源码打出来的」，下次好判断能不能沿用。"""
+    import json
+    os.makedirs(os.path.dirname(stamp_path(name)), exist_ok=True)
+    data = {'sources': dict((os.path.basename(path), file_sha256(path)) for path in sources),
+            'exe': file_sha256(exe)}
+    with open(stamp_path(name), 'w', encoding='utf-8') as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        handle.write('\n')
 
 
 def run(args, env=None):
@@ -163,13 +224,60 @@ def directory_size(path):
 
 
 def build_installer():
+    """安装程序本体。图标跟主程序用同一个（不然资源管理器里是个默认的 PyInstaller 图标）。"""
+    if not os.path.isfile(ICON):
+        build_icon()                      # 只单跑 installer / uninstaller 那一步时图标还没画
     run([sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', '--onefile',
-         '--windowed', '--name', 'AutoPlay-安装程序', '--distpath', INSTALLER_DIST,
+         '--windowed', '--icon', ICON, '--name', 'AutoPlay-安装程序',
+         '--distpath', INSTALLER_DIST,
          '--workpath', os.path.join(HERE, 'build_installer'),
          '--specpath', os.path.join(HERE, 'build_installer'), 'installer.py'])
     if not os.path.isfile(INSTALLER_EXE):
         raise SystemExit('[x] 没看到 %s，安装程序本体没打出来' % INSTALLER_EXE)
     log('安装程序本体好了：%s' % INSTALLER_EXE)
+
+
+def build_uninstaller():
+    """卸载程序：装进安装目录的那个 uninstall.exe（纯标准库，比本体小得多）。"""
+    if not os.path.isfile(ICON):
+        build_icon()
+    sources = [os.path.join(HERE, 'uninstall.py'), ICON]
+    if can_reuse('uninstall', sources, UNINSTALLER_EXE):
+        return
+    run([sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', '--onefile',
+         '--windowed', '--icon', ICON, '--name', 'uninstall',
+         '--distpath', INSTALLER_DIST,
+         '--workpath', os.path.join(HERE, 'build_installer', 'uninstall'),
+         '--specpath', os.path.join(HERE, 'build_installer'), 'uninstall.py'])
+    if not os.path.isfile(UNINSTALLER_EXE):
+        raise SystemExit('[x] 没看到 %s，卸载程序没打出来' % UNINSTALLER_EXE)
+    remember_build('uninstall', sources, UNINSTALLER_EXE)
+    log('卸载程序好了：%s（%.1f MB）'
+        % (UNINSTALLER_EXE, os.path.getsize(UNINSTALLER_EXE) / 1048576.0))
+
+
+def build_updater():
+    """
+    增量更新器：跟卸载程序一样是纯标准库的小 exe，装到安装目录根上。
+
+    客户端下载差分包之后把它复制到 %TEMP% 再启动（它要覆盖安装目录里的自己，
+    正跑着的 exe 锁着换不了），所以每台装了这个版本的机器都已经带着它。
+    """
+    if not os.path.isfile(ICON):
+        build_icon()
+    sources = [os.path.join(HERE, 'updater.py'), ICON]
+    if can_reuse('updater', sources, UPDATER_EXE):
+        return
+    run([sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', '--onefile',
+         '--windowed', '--icon', ICON, '--name', 'AutoPlayUpdater',
+         '--distpath', INSTALLER_DIST,
+         '--workpath', os.path.join(HERE, 'build_installer', 'updater'),
+         '--specpath', os.path.join(HERE, 'build_installer'), 'updater.py'])
+    if not os.path.isfile(UPDATER_EXE):
+        raise SystemExit('[x] 没看到 %s，更新器没打出来' % UPDATER_EXE)
+    remember_build('updater', sources, UPDATER_EXE)
+    log('增量更新器好了：%s（%.1f MB）'
+        % (UPDATER_EXE, os.path.getsize(UPDATER_EXE) / 1048576.0))
 
 
 # ---------- 4. payload + 追加 ----------
@@ -196,6 +304,16 @@ def build_payload(path, edition):
                     zf.write(full, arc)
                     count += 1
                     total += os.path.getsize(full)
+        if not os.path.isfile(UNINSTALLER_EXE):      # 卸载程序，装到安装目录根上
+            raise SystemExit('[x] 没有 %s：先跑一遍 python make_installer.py uninstaller'
+                             % UNINSTALLER_EXE)
+        zf.write(UNINSTALLER_EXE, 'app/uninstall.exe')
+        count += 1
+        if not os.path.isfile(UPDATER_EXE):          # 增量更新器，客户端更新时用它换文件
+            raise SystemExit('[x] 没有 %s：先跑一遍 python make_installer.py updater'
+                             % UPDATER_EXE)
+        zf.write(UPDATER_EXE, 'app/AutoPlayUpdater.exe')
+        count += 1
         if os.path.isfile(ICON):            # 快捷方式要用它当图标
             zf.write(ICON, 'app/AutoPlay.ico')
             count += 1
@@ -242,6 +360,12 @@ def main(argv):
             build_app(edition)
     if 'all' in steps or 'installer' in steps:
         build_installer()
+        build_uninstaller()
+        build_updater()
+    elif 'uninstaller' in steps:
+        build_uninstaller()
+    elif 'updater' in steps:
+        build_updater()
     os.makedirs(os.path.join(HERE, 'build_installer'), exist_ok=True)
     made = []
     for edition in EDITIONS:

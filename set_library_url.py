@@ -31,23 +31,43 @@ r"""
 
 空的 = 没配过：程序里的「联网曲库」会提示还没有地址，本地曲库照常能用。
 
-要填的格式（任选一个，推荐上面那个，国内更稳）：
+要填的格式（任选一个）：
 
     https://cdn.jsdelivr.net/gh/<用户名>/<仓库>@<分支>/library.json
     https://raw.githubusercontent.com/<用户名>/<仓库>/<分支>/library.json
+
+注意：这里改的是 **GitHub 曲库（备用源）** 那一份；国内曲库（Gitee，默认用的那个）
+是 GITEE_INDEX_URL，本脚本会原样保留，不覆盖。
 
 也可以不改这里，直接在 %LOCALAPPDATA%\\AutoPlay\\library\\source.txt 里写一行地址
 （改完重启就生效，不用重新打包）。
 """
 
 INDEX_URL = __URL__
+GITEE_INDEX_URL = __GITEE__
 '''
 
 
+def read_gitee_url():
+    """把 library_source.py 里现成的 GITEE_INDEX_URL 读出来（重写时保住它）。"""
+    try:
+        import re
+        with open(SOURCE_PY, encoding='utf-8') as handle:
+            text = handle.read()
+        match = re.search(r"^GITEE_INDEX_URL\s*=\s*(['\"])(.*?)\1", text, re.M)
+        if match:
+            return match.group(2)
+    except OSError:
+        pass
+    return 'https://gitee.com/juanneys/midi-music/raw/master/library.json'
+
+
 def write_url(url):
-    """把地址写进 library_source.py。"""
+    """把地址写进 library_source.py（Gitee 那一份原样留着）。"""
+    gitee = read_gitee_url()
     with open(SOURCE_PY, 'w', encoding='utf-8', newline='') as handle:
-        handle.write(TEMPLATE.replace('__URL__', repr(url or '')))
+        handle.write(TEMPLATE.replace('__URL__', repr(url or ''))
+                             .replace('__GITEE__', repr(gitee or '')))
     return SOURCE_PY
 
 

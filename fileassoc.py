@@ -23,8 +23,8 @@
 
 装 / 卸
 -------
-安装程序里勾了「关联工程文件」就会调 register()；卸载时那份 bat 里会调
-`reg delete` 把同样的位置删掉（见 installer.make_uninstaller）。程序里那个
+安装程序里勾了「关联工程文件」就会调 register()；卸载时安装目录里那个
+`uninstall.exe` 会调 unregister() 把同样的位置删掉。程序里那个
 「关联 .mproj 工程文件」勾选框也是调这儿。
 """
 
@@ -45,13 +45,6 @@ PROGID_KEY = r'Software\Classes' + '\\' + PROGID
 OPEN_KEY = PROGID_KEY + r'\shell\open\command'
 ICON_KEY = PROGID_KEY + r'\DefaultIcon'
 OPEN_WITH_KEY = SUFFIX_KEY + r'\OpenWithProgids'
-# 安装程序卸载时那份 bat 里要删的东西，跟这儿保持一致
-UNINSTALL_BAT_LINES = (
-    'reg delete "HKCU\\%s" /f >nul 2>&1' % PROGID_KEY,
-    'reg delete "HKCU\\%s" /v "%s" /f >nul 2>&1' % (OPEN_WITH_KEY, PROGID),
-    'reg query "HKCU\\%s" /ve 2>nul | findstr /i "%s" >nul && '
-    'reg delete "HKCU\\%s" /f >nul 2>&1' % (SUFFIX_KEY, PROGID, SUFFIX_KEY),
-)
 
 
 def available():

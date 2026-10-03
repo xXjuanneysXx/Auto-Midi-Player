@@ -23,8 +23,12 @@ AutoPlay 安装程序
 payload 里两棵树：
     app/     程序本体（AutoPlay.exe + _internal\\...）
     songs/   内置曲库，装到 <安装目录>\\songs\\，默认那首就是《鸟之诗》
+
+app/ 里还带着打包好的卸载程序 uninstall.exe，装完就躺在安装目录根上；安装程序再往
+旁边写一份 uninstall.json，告诉它「装在哪、删哪些快捷方式、要不要取消 .mproj 关联」。
 """
 
+import json
 import os
 import shutil
 import struct
@@ -54,8 +58,10 @@ import fileassoc                          # .mproj 文件关联（跟主程序�
 
 APP_NAME = 'AutoPlay'
 APP_TITLE = 'MIDI 简谱自动演奏'
-APP_VERSION = '1.0'
+APP_VERSION = '1.0.3'
 APP_EXE = 'AutoPlay.exe'
+UNINSTALL_EXE = 'uninstall.exe'       # 打包时放进 payload，装完在安装目录根上
+UNINSTALL_JSON = 'uninstall.json'     # 安装时写，告诉上面那个 exe 该怎么卸
 PUBLISHER = 'AutoPlay'
 UNINSTALL_KEY = r'Software\Microsoft\Windows\CurrentVersion\Uninstall\AutoPlay'
 SHORTCUT_NAME = 'AutoPlay 简谱演奏'
@@ -266,11 +272,20 @@ def make_shortcut(link, target, workdir, icon=None, description=''):
 
     没装 pywin32，所以借系统自带的 PowerShell 调 WScript.Shell —— 这台机器上
     只要有 Windows 就有它，不用额外带任何东西。
+
+    两处兜底：
+      - powershell 不在 PATH 上（精简系统 / 特殊环境）就按 %SystemRoot% 拼绝对路径再试；
+      - 建完喊一声 SHChangeNotify。光把 .lnk 写进文件系统，资源管理器不一定会马上重画
+        桌面，用户装完往桌面上一看「怎么没有快捷方式」，其实只是没刷新。
+
+    建完还会回头看一眼文件到底在不在 —— 宁可报一句错，也别让用户对着空桌面猜。
     """
     def quote(text):
         return "'" + str(text).replace("'", "''") + "'"
 
-    script = ['$s=(New-Object -ComObject WScript.Shell).CreateShortcut(%s);' % quote(link),
+    # 先让 PowerShell 用 UTF-8 吐结果：不然报错信息是本地代码页，解码出来全是乱码
+    script = ['[Console]::OutputEncoding=[Text.Encoding]::UTF8;',
+              '$s=(New-Object -ComObject WScript.Shell).CreateShortcut(%s);' % quote(link),
               '$s.TargetPath=%s;' % quote(target),
               '$s.WorkingDirectory=%s;' % quote(workdir)]
     if icon:
@@ -278,47 +293,57 @@ def make_shortcut(link, target, workdir, icon=None, description=''):
     if description:
         script.append('$s.Description=%s;' % quote(description))
     script.append('$s.Save();')
+    command = ''.join(script)
     flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-    result = subprocess.run(['powershell', '-NoProfile', '-NonInteractive',
-                             '-Command', ''.join(script)],
-                            capture_output=True, text=True, creationflags=flags)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip()
-                           or '创建快捷方式失败')
-    return link
+    problems = []
+    for exe in powershell_paths():
+        try:
+            result = subprocess.run([exe, '-NoProfile', '-NonInteractive',
+                                     '-Command', command],
+                                    capture_output=True, encoding='utf-8', errors='replace',
+                                    creationflags=flags)
+        except OSError as exc:
+            problems.append('%s：%s' % (exe, exc))
+            continue
+        if result.returncode == 0 and os.path.isfile(link):
+            fileassoc.notify_shell()      # 让资源管理器/桌面立刻显示出来
+            return link
+        why = (result.stderr or result.stdout or '').strip() or ('退出码 %s' % result.returncode)
+        if result.returncode == 0:
+            why = '命令跑完了但没生成 %s' % os.path.basename(link)
+        problems.append('%s：%s' % (exe, why))
+    raise RuntimeError('创建快捷方式失败：%s' % '；'.join(problems))
+
+
+def powershell_paths():
+    """先按 PATH 上的 powershell，再按 %SystemRoot% 拼绝对路径（PATH 不认时兜底）。"""
+    paths = ['powershell']
+    root = os.environ.get('SystemRoot') or os.environ.get('WINDIR')
+    if root:
+        full = os.path.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+        if os.path.isfile(full):
+            paths.append(full)
+    return paths
 
 
 def make_uninstaller(install_dir, shortcuts, assoc=False):
     """
-    在安装目录里写一个卸载用的 bat（路径都写死，双击就能卸干净）。
+    把「怎么卸」写进安装目录里的 uninstall.json，紧挨着打包时就放进来的 uninstall.exe。
 
-    assoc=True 表示装的时候关联过 .mproj，卸载时把注册表里那几项一起删掉。
-    删除的写法跟 fileassoc.UNINSTALL_BAT_LINES 是同一份 —— 装和卸用的是同一套路径，
-    免得一边改了一边忘了。
+    exe 里是死逻辑（哪台机器上都是同一份），「装在哪儿 / 删哪些快捷方式 / 要不要
+    取消 .mproj 关联」随安装变，所以由安装程序写到它旁边的 json 里；那两个版本各装
+    各的目录、各有各的 json，同时装着也不会互相认错。
+    assoc=True 表示装的时候关联过 .mproj，卸载时把注册表里那几项一起删掉 —— 那份
+    删除逻辑就是 fileassoc.unregister()，跟程序里那个勾选框共用一套。
     """
-    path = os.path.join(install_dir, '卸载.bat')
-    lines = ['@echo off', 'chcp 65001 >nul',
-             'rem AutoPlay 卸载程序（安装时自动生成）',
-             'rem 自己正跑在被删的目录里，所以先复制到 TEMP 再换个进程跑',
-             'if not "%~1"=="go" (',
-             '  copy /y "%~f0" "%TEMP%\\AutoPlay-uninstall.bat" >nul',
-             '  start "" /min "%TEMP%\\AutoPlay-uninstall.bat" go',
-             '  exit /b',
-             ')',
-             'timeout /t 2 /nobreak >nul',
-             'taskkill /f /im %s >nul 2>&1' % APP_EXE,
-             'rd /s /q "%s"' % install_dir]
-    for link in shortcuts:
-        lines.append('del "%s" >nul 2>&1' % link)
-    if assoc:
-        lines.append('rem 取消 .mproj 工程文件关联（只删本程序写的那几项）')
-        lines += list(fileassoc.UNINSTALL_BAT_LINES)
-    lines += ['reg delete "%s" /f >nul 2>&1' % UNINSTALL_KEY,
-              'del "%~f0" >nul 2>&1',
-              '']
-    with open(path, 'w', encoding='utf-8', newline='\r\n') as handle:
-        handle.write('\n'.join(lines))
-    return path
+    exe = os.path.join(install_dir, UNINSTALL_EXE)
+    if not os.path.isfile(exe):
+        raise RuntimeError('安装目录里没有 %s（卸载程序），卸载入口装不上' % UNINSTALL_EXE)
+    config = {'title': APP_TITLE, 'dir': install_dir, 'exe': APP_EXE,
+              'key': UNINSTALL_KEY, 'shortcuts': list(shortcuts), 'assoc': bool(assoc)}
+    with open(os.path.join(install_dir, UNINSTALL_JSON), 'w', encoding='utf-8') as handle:
+        json.dump(config, handle, ensure_ascii=False, indent=2)
+    return exe
 
 
 def register_uninstall(install_dir, uninstaller, size_kb):
@@ -367,7 +392,9 @@ class Installer:
 
         payload, _path = open_payload()
         with payload:
+            self._check_payload(payload)
             self._extract(payload, target)
+        self._clean_old(target)
 
         self.report('写说明文件…', 1, 1)
         self._write_readme(target)
@@ -408,8 +435,29 @@ class Installer:
 1. 双击 AutoPlay.exe。第一次会问一次管理员权限 —— 这是必须的：游戏要用管理员
    身份运行，本程序也必须提权，否则 Windows 会把发过去的按键全拦掉。
 2. 启动后会自己载入内置曲库里的《鸟之诗》。想换曲子点「选择 MIDI 文件…」，
-   或者点「内置曲库」。
+   或者点「曲库」—— 自带的 songs\\ 和联网曲库下载过的曲子都在那个列表里
+   （上面有「内置曲库」「已下载」两个快捷入口）。
 3. 点「开始演奏」，然后切回游戏。开始之前先点一下游戏窗口让它拿到焦点。
+
+顶部那几个按钮
+--------------
+公告 / 更新 / B站主页 / GitHub。公告和更新是程序启动后自己去曲库仓库
+（Gitee / GitHub）拉回来的，会各开一个独立窗口（能最小化、不置顶）。
+有新版本的时候：这一版（v1.0.2 起）能**增量更新** —— 只下改动过的文件
+（几十 MB，不用重下两百多 MB 的完整包），点「立即更新」就行；下好程序会自己
+退出、由 AutoPlayUpdater.exe 换好文件再自己开回来，换到一半出问题会自动还原。
+装的是更老的版本（没有更新器）就只能点「去下载」下完整安装包（会打开 B站主页，
+下载链接发在那儿）。
+B站主页和 GitHub 用系统默认浏览器打开，不在程序里嵌浏览器。
+拉不到网络就安静地用上次那份（更新清单除外，它不缓存）。
+
+窗口右上角那几个键
+------------------
+已就绪（状态胶囊）+ 主题下拉是圆角矩形；键位 / 最小化 / 最大化 / 关闭是直角方块。
+· 最小化：正常最小化，任务栏里能找到；
+· 关闭（×）：不退出程序，是收进**托盘**后台（任务栏不占位，演奏和热键照常）；
+  要真退出就在托盘图标上右键 →「退出」；
+· 勾掉界面上的「显示演奏状态」可以把右上角那颗状态胶囊藏起来（嫌它挡事时用）。
 
 快捷键（界面右下角「快捷键设置…」里可以改）
 --------------------------------------------
@@ -430,21 +478,24 @@ Ctrl+F2   开关跟奏模式
 界面上那个「录制时发声」是个纯开关：勾着，录制时按一个琴键就响一声（听得出自己
 弹得对不对）；不勾就全程不出声。嫌吵就关掉。
 
-两个标签页
-----------
-演奏        选曲子、调音长、试听、开始弹。
-简谱编辑器  把音轨铺成钢琴卷帘手动改：双击空白加音、右键音块删音、拖着改长短，
-            拖右边缘改时值，Ctrl+Z 撤销。改完点「导出 MIDI…」，导出的文件会
-            自动载回主程序。那一页里：空格 = 播放/停止，F11 = 最大化 / 还原。
-            没改完也能存成工程文件（.mproj）：装的时候勾了「关联文件类型」的话，
-            以后在资源管理器里双击 .mproj 就直接开程序并进这一页。
-            程序已经开着的时候双击工程文件，**不会**再起一个程序 —— 那个新进程会把
-            文件交给已经在跑的这个，自己退出；这边另开一个编辑器窗口打开它。
+简谱编辑器（完全版才有）
+------------------------
+点「简谱编辑器…」会另开一个编辑器窗口（跟主界面分开的普通窗口：能最小化、不置顶），
+把音轨铺成钢琴卷帘手动改：双击空白加音、右键音块删音、拖着改长短，拖右边缘改时值，
+点一下两个音之间的空白就选中那段间隔、按 Delete 删掉（后面的音自动接上、不留新缝），
+时间尺上方那个「方块 + 倒三角」按住拖动就能挪光标；空格 = 播放 / 暂停，
+Ctrl+Z 撤销、Ctrl+S 存工程。改完点「导出 MIDI…」，
+导出的文件会自动载回主程序。
+没改完也能存成工程文件（.mproj）：装的时候勾了「关联文件类型」的话，以后在
+资源管理器里双击 .mproj 就直接开程序并弹出编辑器窗口。程序已经开着的时候双击
+工程文件，**不会**再起一个程序 —— 那个新进程会把文件交给已经在跑的这个，自己退出；
+这边另开一个编辑器窗口打开它。
 
 文件夹
 ------
 songs\\        内置曲库，往里面扔 .mid 就会出现在「内置曲库」里
 _internal\\    运行库，别删别改
+AutoPlayUpdater.exe  增量更新时换文件用的小程序（平时不用管它）
 
 谱面文件
 --------
@@ -457,7 +508,9 @@ _internal\\    运行库，别删别改
 
 卸载
 ----
-设置 →「应用」里搜 AutoPlay；或者直接删掉整个安装目录。
+设置 →「应用」里搜 AutoPlay，或者双击安装目录里的 uninstall.exe。
+卸载只删程序本体和快捷方式，%%LOCALAPPDATA%%\AutoPlay 里的设置 / 日志 / 录制 /
+谱面都留着 —— 重新装回来还认得你。
 """ % (APP_TITLE, APP_VERSION, EDITION_LABEL,
                 '=' * (len(APP_TITLE) + len(APP_VERSION) + len(EDITION_LABEL) + 5))
         with open(os.path.join(target, '说明.txt'), 'w', encoding='utf-8',
@@ -477,6 +530,27 @@ _internal\\    运行库，别删别改
                 '这个目录写不进去：%s\n\n%s\n\n'
                 '换一个目录（比如「恢复默认」那个），或者右键安装程序\n'
                 '选「以管理员身份运行」。' % (target, exc))
+
+    @staticmethod
+    def _check_payload(payload):
+        """先看一眼卸载程序在不在包里 —— 装到一半才发现缺东西最难受。"""
+        if 'app/' + UNINSTALL_EXE not in set(payload.namelist()):
+            raise RuntimeError('这个安装包里没有 %s（卸载程序），'
+                               '请重新下载完整的安装包。' % UNINSTALL_EXE)
+
+    @staticmethod
+    def _clean_old(target):
+        """
+        老版本在安装目录里留过一份「卸载.bat」（当场生成的），现在换成打包带的
+        uninstall.exe 了，升级安装时把那份旧的删掉 —— 留着会让人以为没换过来。
+        删不掉（比如被占用）不是事，卸载的时候整个目录都会走。
+        """
+        stale = os.path.join(target, '卸载.bat')
+        if os.path.isfile(stale):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
 
     def _extract(self, payload, target):
         """把 payload 流式解压到目标目录，顺便报进度。"""
@@ -529,6 +603,7 @@ _internal\\    运行库，别删别改
                 os.makedirs(os.path.dirname(link), exist_ok=True)
                 make_shortcut(link, exe, target, icon, APP_TITLE)
                 made.append(link)
+                self.report('快捷方式好了：%s' % link, 1, 1)
             except Exception as exc:      # 快捷方式建不上不该让整个安装失败
                 self.report('快捷方式没建成（%s）：%s' % (os.path.basename(link), exc), 1, 1)
         return made
@@ -633,7 +708,7 @@ class InstallerWindow(QWidget):
             self.assoc_box = QCheckBox('双击 .mproj 工程文件用本程序打开（关联文件类型）')
             self.assoc_box.setChecked(True)
             self.assoc_box.setToolTip('把简谱工程的工程文件（.mproj）关联到本程序：以后在资源管理器里\n'
-                                      '双击它就直接开程序并进「简谱编辑器」。\n'
+                                      '双击它就直接开程序、弹出简谱编辑器窗口。\n'
                                       '只写在当前用户（HKCU）里，不需要管理员权限，卸载时会一起清掉。')
             box.addWidget(self.assoc_box)
         box.addWidget(self.run_box)
@@ -788,13 +863,19 @@ class InstallerWindow(QWidget):
         self.target = message or self.target
         self.title.setText('装好了')
         self.done_title.setText('安装完成')
+        link = os.path.join(desktop_dir(), SHORTCUT_NAME + '.lnk')
+        if os.path.isfile(link):
+            shortcut_line = '· 桌面上的「%s」已经放好了（%s）；\n' % (SHORTCUT_NAME, link)
+        else:
+            shortcut_line = ('· 桌面上没找到快捷方式。想手动放一个：右键 %s，'
+                             '「发送到」→「桌面快捷方式」；\n' % os.path.join(self.target, APP_EXE))
         self.done_text.setText(
             '装到：%s\n\n'
-            '· 双击桌面上的「%s」就能用（第一次运行会问一次管理员权限，'
-            '因为要往游戏里发按键）；\n'
+            '%s'
+            '· 双击它就能用（第一次运行会问一次管理员权限，因为要往游戏里发按键）；\n'
             '· 内置曲库在同目录的 songs 文件夹，默认那首是《鸟之诗》；\n'
-            '· 想卸载：设置 →「应用」里搜 AutoPlay，或者直接删掉这个目录。'
-            % (self.target, SHORTCUT_NAME))
+            '· 想卸载：设置 →「应用」里搜 AutoPlay，或者双击目录里的 uninstall.exe。'
+            % (self.target, shortcut_line))
         if self.run_box.isChecked():
             self._run_app()
 

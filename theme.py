@@ -50,7 +50,8 @@ APP_FOLDER = 'AutoPlay'
 THEME_SUFFIX = '.json'
 # 预设配色自己也有版本号：以后改了预设（比如给音符换色调），老版本写出去的 json
 # 版本号对不上就自动重写一遍。用户自己加 / 手改的文件没有这个字段，永远不动。
-PRESET_REV = 2
+# rev 3：加了新拟态那七个角色（neu_*），老用户的预设 json 要重写一遍才带得上。
+PRESET_REV = 3
 
 # 基准配色 = 程序原来写死的那些颜色，角色名 -> 色号。
 # 顺序也就是「同一个色号当多个角色用时，算哪个角色」的优先级（见 _hex_roles）。
@@ -129,6 +130,17 @@ BASE = {
     # —— 跟奏 ——
     'follow_idle_glow': '#9fc4ff',
     'follow_dim': '#5a6478',
+    # —— 新拟态（Neumorphism）：控件 / 卡片是「同底色挤出来的一块」——
+    #    左上高光 + 右下暗部 = 凸起；反过来 = 按下去 / 凹槽。
+    #    这几个色号默认都从上面那套深色底里算出来，跟着主题一起转；
+    #    每套预设要是不好看，直接在 json 里改这几行就行（见 docs/主题格式.md）。
+    'neu_base': '#1b2231',        # 控件 / 卡片的面（比窗口底色亮一档）
+    'neu_light': '#242d40',       # 左上高光
+    'neu_dark': '#141a26',        # 右下暗部
+    'neu_border': '#232b3d',      # 中性描边
+    'neu_pressed': '#181e2b',     # 按下 / 选中时的面
+    'neu_inset': '#151b27',       # 凹槽（输入框 / 列表 / 进度条底）
+    'neu_shadow': '#0a0d14',      # 投射阴影（配 QGraphicsDropShadowEffect 用）
 }
 
 # 六种「要按哪个鼠标键」对应的颜色：操作 -> (尾色, 头色)
@@ -443,6 +455,20 @@ def names():
     out = [DEFAULT_NAME] if DEFAULT_NAME in have else []
     out += [name for name in have if name != DEFAULT_NAME]
     return out
+
+
+# 线上主题（预埋）
+# ----------------
+# 以后的主题也放在曲库仓库里（根目录的 themes.json，一条一套，结构跟本地主题文件
+# 一模一样），程序把它拉下来追加到下拉框最后。现在只做「入口」：下拉框里能看到
+# 这一条，但是灰的、点不了 —— 免得用户以为选了没反应。
+ONLINE_NAME = '线上主题（未上线）'
+ONLINE_FILE = 'themes.json'          # 曲库仓库根目录里的那个文件（见 notice.py 的取法）
+
+
+def names_for_combo():
+    """下拉框里的候选：本地那几套 + 最后一条「线上主题」占位。"""
+    return names() + [ONLINE_NAME]
 
 
 def describe(name):

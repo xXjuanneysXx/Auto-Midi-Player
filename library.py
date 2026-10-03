@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-联网曲库：曲子放在 GitHub 上，程序自己去拉
-==========================================
+联网曲库：曲子放在 Gitee / GitHub 上，程序自己去拉
+==================================================
 
-没有服务器也能共享曲库：把 midi 传到一个 GitHub 仓库里，再放一个**索引文件**
-`library.json`，程序读这一个网址就知道有哪些曲子、每首多大、在仓库里叫什么。
+没有服务器也能共享曲库：把 midi 传到一个仓库里，再放一个**索引文件**
+`library.json`，程序读这一个地址就知道有哪些曲子、每首多大、在仓库里叫什么。
 
     仓库结构（随便你，路径写在索引里就行）
         library.json
@@ -24,27 +24,33 @@
     `file` 写**相对于索引文件的路径**（上面就是 songs/xxx.mid），所以程序只要一个
     索引地址就能推算出每首曲子的下载地址。
 
-索引地址写在哪儿
-----------------
-1. `library_source.py` 里的 `INDEX_URL` —— 打包的时候定下来的默认值（见
-   「设置联网曲库并重新打包.bat」，给它一个链接它就重打包）；
-2. `%LOCALAPPDATA%\\AutoPlay\\library\\source.txt` —— 本地覆盖，改完重启就生效，
-   不用重新打包（自己搭了个别的仓库、或者源挂了想换一个，用这个最快）。
+两套曲库：国内（Gitee）/ GitHub
+-------------------------------
+默认走**国内曲库（Gitee）** —— 国内直连 GitHub 的 raw 经常连不上。界面上能一键
+切换，选哪套记在 `%LOCALAPPDATA%\\AutoPlay\\library\\source_name.txt` 里，重启也记得。
 
-推荐写成国内更稳的镜像地址（GitHub 的 raw 在国内经常连不上）：
+地址分别写在（打包时定下来的默认值）：
 
-    https://cdn.jsdelivr.net/gh/<用户名>/<仓库>@<分支>/library.json
-    https://raw.githubusercontent.com/<用户名>/<仓库>/<分支>/library.json
+    library_source.py   GITEE_INDEX_URL = https://gitee.com/<你>/<仓库>/raw/<分支>/library.json
+                        INDEX_URL       = https://cdn.jsdelivr.net/gh/<你>/<仓库>@<分支>/library.json
+
+想临时换个仓库（或者源挂了想换一个）不用重新打包：往
+`%LOCALAPPDATA%\\AutoPlay\\library\\source.txt` 写一行地址就顶掉了当前那套。
+
+⚠ Gitee 的一个坑：它的 raw 直链会过内容审核，library.json 这种「里面一堆中文歌名」
+的文本文件会被挡下来（HTTP 451，换文件名也没用）。所以 Gitee 的**索引走 API**
+（contents 接口，公开仓库匿名就能读），只有 midi 文件才走 raw 直链 —— midi 是
+二进制，实测不会被挡。
 
 没有 library.json 也能用（兜底）
 -------------------------------
 索引文件是「给程序看的一份歌单」，得先有人把它放进仓库。要是仓库里**只有
-midi、没有索引**，程序不会干等着：它发现索引拉不到，就**干脆直接问 GitHub 这个
-仓库里有哪些文件**（GitHub 的文件列表 API），把里面所有 `.mid / .midi` 当成歌单。
+midi、没有索引**，程序不会干等着：它发现索引拉不到，就**干脆直接问这个仓库里
+有哪些文件**（文件列表 API），把里面所有 `.mid / .midi` 当成歌单。
 所以一个「只往里丢 midi」的仓库开箱就能用，不用额外维护 library.json。
 
-（这一下是匿名请求，GitHub 对匿名调用有次数限制 —— 一小时几十次，刷新歌单够用了。
-真要传曲子、改索引，还是得有令牌，见下面。）
+（这一下是匿名请求。GitHub 对匿名调用有次数限制 —— 一小时几十次；Gitee 的
+git/trees 接口匿名调没问题。刷新歌单够用了。真要传曲子、改索引，还是得有令牌，见下面。）
 
 拉不到会怎么样
 --------------
@@ -53,22 +59,25 @@ midi、没有索引**，程序不会干等着：它发现索引拉不到，就**
 
 上传（把曲子传回仓库）
 ----------------------
-程序也能往这个仓库里传东西 —— 用 GitHub 的 Contents API，要靠一个**访问令牌**
-（Contents 读写）。这个令牌是**内置在程序里**的：见同目录的 github_token_local.py
-（那个文件不进 git，只有自己这台机器和自己打出来的包里有）。
+程序也能往仓库里传东西 —— 用 Contents API，要靠一个**访问令牌**（仓库读写）。
+两个令牌都是**内置在程序里**的：Gitee 在 gitee_token_local.py、GitHub 在
+github_token_local.py（这两个文件不进 git，只有自己这台机器和自己打出来的包里有）。
 界面上没有「填令牌」这一项，打开就能传。
 
-想让程序用别的令牌：改 github_token_local.py 里的 TOKEN，重新打包。
+想让程序用别的令牌：改对应文件里的 TOKEN，重新打包。
 
 传一首曲子做两件事：把 midi 写进仓库，再把 library.json 按仓库里现有的文件重新
-生成一遍（所以索引不会写着写着就和仓库对不上）。
+生成一遍（所以索引不会写着写着就和仓库对不上）。**上传时两套曲库都传**，
+传一次两个仓库都有 —— 国内用户走 Gitee，海外 / Gitee 挂了还能走 GitHub。
 
 曲库是公开的、大家一起用的仓库：传上去就是分享出去，所有人都能看见、能下载。
 
 两条路，任选：
 
-    library.upload_song(本地文件, 标题, 艺术家)
-    library.refresh_index(owner, repo, branch)             # 只重排索引，不传新文件
+    library.upload_song_all(本地文件, 标题, 艺术家)         # 两套曲库都传
+    library.refresh_index_all()                            # 只重排索引，不传新文件
+    library.upload_song(..., site='gitee')                 # 只传某一套
+    library.refresh_index(owner, repo, branch, site=...)   # 只重排某一套
 """
 
 import base64
@@ -87,8 +96,9 @@ APP_FOLDER = 'AutoPlay'
 INDEX_NAME = 'library.json'
 # 拉索引最多等这么久（秒）；网断了也要几秒钟就回来，不能把界面卡住
 INDEX_TIMEOUT = 6.0
-# 下载一首曲子最多等这么久
-SONG_TIMEOUT = 30.0
+# 下载一首曲子最多等这么久（秒）。曲库里的 midi 都是几十 KB 的小文件，10 秒还没
+# 下完基本就是网络不通了 —— 早点了断，别让界面干等着（用户会以为程序卡死）。
+SONG_TIMEOUT = 10.0
 # 缓存里的索引多久算「旧」（秒）：旧的先拿本地那份顶上，同时后台再刷新
 INDEX_STALE = 6 * 3600
 USER_AGENT = 'AutoPlay/1.0 (+midi jianpu player)'
@@ -100,6 +110,18 @@ API_TIMEOUT = 30.0
 TOKEN_NAME = 'github_token.txt'
 # 什么样的文件算「曲子」
 MIDI_SUFFIX = ('.mid', '.midi')
+# 下架名单：这些曲子不再出现在联网歌单里（按文件名 / 标题匹配，子串就算）。
+# 「邓垚 - 诀别书」是个 10MB 的大文件，仓库里早就删了，可旧索引里还留着一条 ——
+# 用户点它只会白等到超时，看着就像程序卡死。拉歌单时顺手滤掉，不用等索引重排。
+HIDDEN_SONGS = ('邓垚 - 诀别书',)
+
+
+def is_hidden(song):
+    """这首歌在不在下架名单里。"""
+    if not isinstance(song, dict):
+        return False
+    text = ('%s %s' % (song.get('file') or '', song.get('title') or '')).lower()
+    return any(word.lower() in text for word in HIDDEN_SONGS)
 # 源代码里带的占位符：别人拿到源码时看到的是一眼假的字符串，程序也会当「没内置令牌」
 # 处理（不然它真拿着这串去请求，只会换来一个莫名其妙的 401）。
 TOKEN_PLACEHOLDER = 'GITHUB_PERSONAL_TOKEN'
@@ -117,6 +139,42 @@ try:
 except Exception:                                   # pragma: no cover
     BAKED_TOKEN = ''
 
+# ============ 两套曲库：国内（Gitee）/ GitHub ============
+#
+# 国内直连 GitHub 经常不通，所以默认走 Gitee；连不上时界面上能一键切到 GitHub。
+# 上传的时候两边都传（传一次，两个仓库都有），下载时由用户选一边。
+#
+# Gitee 的一个坑：raw 直链会过内容审核，library.json 这种「里面一堆中文歌名」的
+# 文本文件会被挡（HTTP 451）。所以 Gitee 这边的**索引走 API**（contents 接口），
+# 只有 midi 文件才走 raw 直链 —— midi 是二进制，实测不会被挡。
+GITEE_API = 'https://gitee.com/api/v5'
+SITE_GITEE = 'gitee'
+SITE_GITHUB = 'github'
+SITE_ORDER = (SITE_GITEE, SITE_GITHUB)          # 第一个是默认（国内直连更稳）
+SITE_LABELS = {SITE_GITEE: '国内曲库（Gitee）',
+               SITE_GITHUB: 'GitHub 曲库'}
+# 内置的默认地址（打包时 library_source.py 里的值优先）
+DEFAULT_GITEE_URL = 'https://gitee.com/juanneys/midi-music/raw/master/library.json'
+DEFAULT_GITHUB_URL = ('https://raw.githubusercontent.com/xXjuanneysXx/'
+                      'midi-music/main/library.json')
+# 选的是哪套曲库（本机覆盖，重启也记得）
+SOURCE_NAME_FILE = 'source_name.txt'
+# Gitee 的备用令牌存哪儿（内置那个能用的话用不到它）
+GITEE_TOKEN_NAME = 'gitee_token.txt'
+GITEE_TOKEN_PLACEHOLDER = 'GITEE_ACCESS_TOKEN'
+
+# 打包时写进来的 Gitee 默认索引地址（没有就退回内置那个）
+try:
+    from library_source import GITEE_INDEX_URL as BAKED_GITEE_URL
+except Exception:                                   # pragma: no cover
+    BAKED_GITEE_URL = ''
+
+# 内置的 Gitee 令牌（gitee_token_local.py，同样不进 git）
+try:
+    from gitee_token_local import TOKEN as BAKED_GITEE_TOKEN
+except Exception:                                   # pragma: no cover
+    BAKED_GITEE_TOKEN = ''
+
 
 def _local_appdata():
     return os.environ.get('LOCALAPPDATA') or tempfile.gettempdir()
@@ -132,8 +190,47 @@ def source_file():
     return os.path.join(cache_dir(), 'source.txt')
 
 
+def source_name():
+    """现在选的是哪套曲库：'gitee'（国内，默认）/ 'github'。"""
+    try:
+        with open(os.path.join(cache_dir(), SOURCE_NAME_FILE), 'r',
+                  encoding='utf-8') as handle:
+            name = handle.read().strip().lower()
+    except OSError:
+        name = ''
+    return name if name in SITE_LABELS else SITE_GITEE
+
+
+def set_source_name(name):
+    """
+    切换曲库（记住选择）。顺便把「自定义地址」清掉 —— 它优先级最高，
+    不清的话切了也看不出变化。
+    """
+    name = str(name or '').strip().lower()
+    if name not in SITE_LABELS:
+        return False
+    try:
+        os.makedirs(cache_dir(), exist_ok=True)
+        with open(os.path.join(cache_dir(), SOURCE_NAME_FILE), 'w',
+                  encoding='utf-8') as handle:
+            handle.write(name + '\n')
+        if os.path.isfile(source_file()):
+            os.remove(source_file())
+        return True
+    except OSError:
+        return False
+
+
+def default_index_url(name=None):
+    """某套曲库的默认索引地址：打包时写进来的 > 内置的。"""
+    name = name or source_name()
+    if name == SITE_GITHUB:
+        return str(BAKED_URL or '').strip() or DEFAULT_GITHUB_URL
+    return str(BAKED_GITEE_URL or '').strip() or DEFAULT_GITEE_URL
+
+
 def source_url():
-    """现在用哪个索引地址：本地覆盖文件 > 打包时写进去的默认值。"""
+    """现在用哪个索引地址：本地覆盖文件 > 当前那套曲库的默认地址。"""
     try:
         with open(source_file(), 'r', encoding='utf-8') as handle:
             text = handle.read().strip()
@@ -141,7 +238,7 @@ def source_url():
             return text
     except OSError:
         pass
-    return str(BAKED_URL or '').strip()
+    return default_index_url()
 
 
 def set_source_url(url):
@@ -205,12 +302,25 @@ def _get(url, timeout):
         return response.read()
 
 
-def _try_all(url, timeout, what):
-    """挨个试镜像，成功就返回 (内容, 出错信息)。"""
+def _try_all(url, timeout, what, total=None):
+    """
+    挨个试镜像，成功就返回 (内容, 出错信息)。
+
+    timeout 是「每个地址最多等多久」，total 是「这一轮总共最多等多久」—— 不能几个
+    镜像各等一遍（两个地址就翻倍，用户会觉得界面卡死了）。total 不写就按「每个地址
+    各等一遍」来，给「拉索引」那种本来就要多试几个地址的场合留余地。
+    """
+    candidates = list(mirrors(url))
+    budget = float(total) if total else float(timeout) * max(1, len(candidates))
+    deadline = time.monotonic() + max(1.0, budget)
     last = ''
-    for candidate in mirrors(url):
+    for index, candidate in enumerate(candidates):
+        left = deadline - time.monotonic()
+        if left <= 0.5:
+            break
+        share = max(0.5, min(float(timeout), left / max(1, len(candidates) - index)))
         try:
-            return _get(candidate, timeout), ''
+            return _get(candidate, share), ''
         except socket.timeout:
             last = '连不上（等超时了，网线 / 代理 / 需要梯子都有可能）'
         except urllib.error.HTTPError as exc:
@@ -244,13 +354,16 @@ def parse_index(text):
         path = str(item.get('file') or item.get('path') or '').strip()
         if not path:
             continue
-        out.append({
+        song = {
             'title': str(item.get('title') or os.path.splitext(os.path.basename(path))[0]),
             'artist': str(item.get('artist') or ''),
             'file': path,
             'size': int(item.get('size') or 0),
             'sha1': str(item.get('sha1') or '').strip().lower(),
-        })
+        }
+        if is_hidden(song):                     # 下架名单里的直接不列（见 HIDDEN_SONGS）
+            continue
+        out.append(song)
     return out
 
 
@@ -263,7 +376,8 @@ def cached_index():
         return [], 0.0
     songs = data.get('songs') if isinstance(data, dict) else None
     when = float(data.get('fetched') or 0.0) if isinstance(data, dict) else 0.0
-    return (songs if isinstance(songs, list) else []), when
+    songs = songs if isinstance(songs, list) else []
+    return [song for song in songs if not is_hidden(song)], when
 
 
 def save_index(songs):
@@ -278,19 +392,21 @@ def save_index(songs):
         return False
 
 
-def songs_from_repo(url=None, timeout=INDEX_TIMEOUT, token=''):
+def songs_from_repo(url=None, timeout=INDEX_TIMEOUT, token='', site=''):
     """
-    兜底：不问索引文件，直接问 GitHub「这个仓库里有哪些文件」。
+    兜底：不问索引文件，直接问「这个仓库里有哪些文件」。
 
     用它的好处是仓库里**只有 midi 也能用**（不用先准备 library.json）。
     `file` 写相对路径，所以下面那套「索引地址 + file」拼下载地址的逻辑一个字都不用改。
 
-    返回 (歌单, 出错信息)。匿名也能调，但有次数限制（一小时几十次）。
+    返回 (歌单, 出错信息)。GitHub 匿名也能调，但有次数限制（一小时几十次）；
+    Gitee 的 git/trees 接口匿名调没问题。
     """
-    owner, repo, branch, why = repo_of(url)
+    site2, owner, repo, branch, why = backend_of(url)
     if why:
         return [], why
-    files, why = repo_files(owner, repo, branch, token,
+    site = site or site2
+    files, why = repo_files(site, owner, repo, branch, token,
                             timeout=max(float(timeout or 0), API_TIMEOUT))
     if why:
         return [], why
@@ -299,17 +415,55 @@ def songs_from_repo(url=None, timeout=INDEX_TIMEOUT, token=''):
         path = str(item.get('path') or '')
         if not is_midi(path):
             continue
-        songs.append({
+        song = {
             'title': os.path.splitext(os.path.basename(path))[0],
             'artist': '',
             'file': path,
             'size': int(item.get('size') or 0),
             'sha1': '',
-        })
+        }
+        if is_hidden(song):
+            continue
+        songs.append(song)
     songs.sort(key=lambda song: song['file'])
     if not songs:
         return [], '这个仓库里一个 midi 都没有（%s）' % repo
     return songs, ''
+
+
+def songs_from_gitee(url=None, timeout=INDEX_TIMEOUT):
+    """
+    国内曲库（Gitee）的索引：**不走 raw 直链**。
+
+    Gitee 的 raw 会过内容审核，library.json 这种「一堆中文歌名」的文本文件会被
+    挡下来（HTTP 451），换文件名也没用。所以这里改走 API：
+        1. contents 接口把 library.json 取回来（公开仓库匿名也能读）；
+        2. 万一没有 / 读不到，就用 git/trees 接口把仓库里的 midi 直接列成歌单。
+    下载曲子仍然走 raw 直链 —— midi 是二进制文件，实测不会被挡。
+
+    返回 (歌单, 出错信息)。
+    """
+    site, owner, repo, branch, why = backend_of(url)
+    if why:
+        return [], why
+    api = _contents_url(site, owner, repo, INDEX_NAME, branch)
+    # 这里是「打开窗口就要等」的那一下，超时按索引那套来（几秒），不能按上传那套的 30 秒
+    data, code, why_read = _api_raw(api, '', timeout=max(float(timeout or 0), INDEX_TIMEOUT))
+    if isinstance(data, dict) and data.get('content'):
+        try:
+            text = base64.b64decode(data['content']).decode('utf-8', 'replace')
+        except Exception:
+            text = ''
+        songs = parse_index(text) if text else None
+        if songs:
+            return songs, ''
+        why_read = '索引文件看不懂（应该是一个 json：{"songs": [...]}）'
+    elif code == 404:
+        why_read = ''
+    songs, why2 = songs_from_repo(url, timeout, site=site)
+    if songs:
+        return songs, ''
+    return [], why_read or why2
 
 
 def fetch_index(url=None, timeout=INDEX_TIMEOUT):
@@ -319,6 +473,7 @@ def fetch_index(url=None, timeout=INDEX_TIMEOUT):
     出错分两种，调用方看歌单是不是空的就知道了：网断了 -> 空歌单 + 一句话；
     拉到了 -> 歌单 + 空字符串。拉到的会顺手存一份当缓存。
 
+    按地址认站点：Gitee 走 API（raw 会被内容审核挡），GitHub 走 raw + jsDelivr 镜像。
     索引拉不到（仓库里还没有 library.json）或者根本不是 json 时，会自动退到
     songs_from_repo()：直接列仓库里的 midi 当歌单。所以「只丢 midi 不写索引」
     的仓库照样能用。
@@ -327,6 +482,14 @@ def fetch_index(url=None, timeout=INDEX_TIMEOUT):
     url = str(url or '').strip()
     if not url:
         return [], '还没有设置联网曲库的地址'
+    site, _owner, _repo, _branch, why = backend_of(url)
+    if why:
+        return [], why
+    if site == SITE_GITEE:
+        songs, why = songs_from_gitee(url, timeout)
+        if songs:
+            save_index(songs)
+        return songs, why
     raw, why = _try_all(url, timeout, '索引')
     songs = None
     if raw is not None:
@@ -392,6 +555,35 @@ def installed_songs():
     return out
 
 
+def downloaded_root():
+    """
+    联网曲库下载的曲子放在哪儿（给「曲库」里那个「已下载」入口跳转用）。
+
+    索引里的 file 多半写成 songs/xxx.mid，所以优先用 cache_dir 下的 songs\\ 子目录；
+    没有的话直接用 cache_dir（用户自己往里拷曲子也算）。
+    """
+    base = cache_dir()
+    songs = os.path.join(base, 'songs')
+    return songs if os.path.isdir(songs) else base
+
+
+def downloaded_files():
+    """
+    本地缓存目录里所有能当曲子读进来的文件：[(路径, 标题), ...]。
+
+    不光认索引里登记过的那几首 —— 用户自己往这个文件夹里拷的也算，方便「下载下来
+    的、手动放进去的」一视同仁地出现在「曲库 -> 已下载」里。
+    """
+    out = []
+    for folder, _dirs, names in os.walk(cache_dir()):
+        for name in names:
+            if name.lower().endswith(MIDI_SUFFIX):
+                path = os.path.join(folder, name)
+                out.append((path, os.path.splitext(name)[0]))
+    out.sort(key=lambda item: item[1].lower())
+    return out
+
+
 def download(song, base=None, timeout=SONG_TIMEOUT):
     """
     下载一首曲子到缓存里。返回 (本地路径, 出错信息)。
@@ -407,7 +599,7 @@ def download(song, base=None, timeout=SONG_TIMEOUT):
     url = song_url(song, base)
     if not url:
         return '', '不知道从哪儿下（索引地址是空的）'
-    raw, why = _try_all(url, timeout, '这个文件')
+    raw, why = _try_all(url, timeout, '这个文件', total=timeout)
     if raw is None:
         return '', why
     want = int(song.get('size') or 0)
@@ -430,114 +622,168 @@ def download(song, base=None, timeout=SONG_TIMEOUT):
 # 只用标准库，不额外装东西。整块功能都是「可选」的：没令牌、没网、仓库不对，
 # 都只是返回一句中文错误，不会影响听歌那一半。
 
-def repo_of(url=None):
+def backend_of(url=None):
     """
-    从索引地址里认出「谁的、哪个仓库、哪个分支」。返回 (owner, repo, branch, 出错信息)。
+    从索引地址里认出「哪个站、谁的、哪个仓库、哪个分支」。
+    返回 (站点, owner, repo, branch, 出错信息)，站点是 'gitee' / 'github'。
 
     认识的写法（就是你填在「曲库地址」里的那种）：
 
+        https://gitee.com/<owner>/<repo>/raw/<branch>/library.json      （国内曲库）
+        https://gitee.com/<owner>/<repo>/blob/<branch>/library.json
         https://raw.githubusercontent.com/<owner>/<repo>/<branch>/library.json
-        https://cdn.jsdelivr.net/gh/<owner>/<repo>@<branch>/library.json
+        https://cdn.jsdelivr.net/gh/<owner>/<repo>@<branch>/library.json   （GitHub 镜像）
         https://github.com/<owner>/<repo>/blob/<branch>/library.json
     """
     url = str(url if url is not None else source_url()).strip()
     if not url:
-        return '', '', '', '还没设置联网曲库的地址（先在曲库地址里填一个）'
+        return '', '', '', '', '还没设置联网曲库的地址（先在曲库地址里填一个）'
     try:
         parts = urllib.parse.urlsplit(url)
     except ValueError:
-        return '', '', '', '这个地址看不懂：%s' % url
+        return '', '', '', '', '这个地址看不懂：%s' % url
     host = parts.netloc.lower()
     bits = [b for b in parts.path.split('/') if b]
+    if host.endswith('gitee.com'):
+        if len(bits) >= 6 and bits[0] == 'api' and bits[2] == 'repos':
+            # /api/v5/repos/<owner>/<repo>/contents/library.json
+            ref = ''
+            query = urllib.parse.parse_qs(parts.query)
+            if query.get('ref'):
+                ref = query['ref'][0]
+            return SITE_GITEE, bits[3], bits[4], (ref or 'master'), ''
+        if len(bits) >= 4 and bits[2] in ('raw', 'blob', 'tree'):
+            return SITE_GITEE, bits[0], bits[1], bits[3], ''
+        return '', '', '', '', ('认不出这是哪个 Gitee 仓库：%s\n'
+                                '（应该形如 https://gitee.com/你/仓库/raw/master/library.json）'
+                                % url)
     if host.endswith('raw.githubusercontent.com') and len(bits) >= 3:
-        return bits[0], bits[1], bits[2], ''
+        return SITE_GITHUB, bits[0], bits[1], bits[2], ''
     if host.endswith('jsdelivr.net') and len(bits) >= 3 and bits[0] == 'gh':
         repo, _, branch = bits[2].partition('@')
-        return bits[1], repo, branch or 'main', ''
+        return SITE_GITHUB, bits[1], repo, branch or 'main', ''
     if host.endswith('github.com') and len(bits) >= 4 and bits[2] in ('blob', 'raw', 'tree'):
-        return bits[0], bits[1], bits[3], ''
-    return '', '', '', ('认不出这是哪个 GitHub 仓库：%s\n'
-                        '（索引地址应该形如 https://raw.githubusercontent.com/你/仓库/main/library.json）' % url)
+        return SITE_GITHUB, bits[0], bits[1], bits[3], ''
+    return '', '', '', '', ('认不出这是哪个曲库仓库：%s\n'
+                            '（Gitee 形如 https://gitee.com/你/仓库/raw/master/library.json，\n'
+                            ' GitHub 形如 https://raw.githubusercontent.com/你/仓库/main/library.json）'
+                            % url)
 
 
-def token_file():
-    """访问令牌存在哪个文件里（只在本机）。"""
-    return os.path.join(cache_dir(), TOKEN_NAME)
+def repo_of(url=None):
+    """跟 backend_of 一样，只是不要站点（老调用方用）。"""
+    _site, owner, repo, branch, why = backend_of(url)
+    return owner, repo, branch, why
 
 
-def has_builtin_token():
+def token_file(site=SITE_GITHUB):
+    """访问令牌存在哪个文件里（只在本机）；Gitee / GitHub 各一份。"""
+    name = GITEE_TOKEN_NAME if site == SITE_GITEE else TOKEN_NAME
+    return os.path.join(cache_dir(), name)
+
+
+def has_builtin_token(site=SITE_GITHUB):
     """内置了令牌没（没内置的话上传那套就白搭，日志里说一声）。"""
-    return bool(get_token())
+    return bool(get_token(site))
 
 
-def get_token():
+def get_token(site=SITE_GITHUB):
     """
-    现在用哪个令牌：**内置的那个优先**，没有才看本机那份（github_token.txt）。
+    现在用哪个令牌：**内置的那个优先**，没有才看本机那份。
 
-    令牌写死在 `github_token_local.py` 里，界面上不让人填 —— 打开就能传。
-    想换一个：改那个文件的 `TOKEN`，重新打包。
+    令牌写死在 `github_token_local.py` / `gitee_token_local.py` 里，界面上不让人填 ——
+    打开就能传。想换一个：改那个文件的 `TOKEN`，重新打包。
     """
-    builtin = str(BAKED_TOKEN or '').strip()
-    if builtin and builtin != TOKEN_PLACEHOLDER:
+    if site == SITE_GITEE:
+        builtin = str(BAKED_GITEE_TOKEN or '').strip()
+        placeholder = GITEE_TOKEN_PLACEHOLDER
+    else:
+        builtin = str(BAKED_TOKEN or '').strip()
+        placeholder = TOKEN_PLACEHOLDER
+    if builtin and builtin != placeholder:
         return builtin
     try:
-        with open(token_file(), 'r', encoding='utf-8') as handle:
+        with open(token_file(site), 'r', encoding='utf-8') as handle:
             return handle.read().strip()
     except OSError:
         return ''
 
 
-def set_token(token):
+def set_token(token, site=SITE_GITHUB):
     """把备用令牌存到本机（传空字符串就是清掉）；内置那个能用时用不到它。"""
     token = str(token or '').strip()
+    path = token_file(site)
     try:
         os.makedirs(cache_dir(), exist_ok=True)
         if token:
-            with open(token_file(), 'w', encoding='utf-8') as handle:
+            with open(path, 'w', encoding='utf-8') as handle:
                 handle.write(token + '\n')
-        elif os.path.isfile(token_file()):
-            os.remove(token_file())
+        elif os.path.isfile(path):
+            os.remove(path)
         return True
     except OSError:
         return False
 
 
-def _contents_url(owner, repo, path, ref=''):
+def _api_base(site):
+    """这个站的 API 根地址（GitHub / Gitee 的路径长得一样，只有域名不同）。"""
+    return GITEE_API if site == SITE_GITEE else GITHUB_API
+
+
+def _contents_url(site, owner, repo, path, ref=''):
     """Contents API 里某个文件 / 某个目录的地址。"""
-    url = '%s/repos/%s/%s/contents/%s' % (GITHUB_API, owner, repo,
+    url = '%s/repos/%s/%s/contents/%s' % (_api_base(site), owner, repo,
                                           urllib.parse.quote(str(path).strip('/')))
     if ref:
         url += '?ref=' + urllib.parse.quote(str(ref))
     return url
 
 
-def _api_error(code, detail=''):
-    """把 GitHub 的报错翻成人话（几个常见的坑各给一句提示）。"""
+def _api_error(site, code, detail=''):
+    """把 API 的报错翻成人话（几个常见的坑各给一句提示）。"""
+    label = 'Gitee' if site == SITE_GITEE else 'GitHub'
     hints = {
-        401: '令牌不对或者过期了，去 GitHub 重新生成一个',
-        403: '没权限（令牌要勾 Contents 读写；也可能是短时间调太多次被限流了）',
+        401: '令牌不对或者过期了，去 %s 重新生成一个' % label,
+        403: '没权限（令牌要勾仓库读写；也可能是短时间调太多次被限流了）',
         404: '找不到这个仓库 / 分支 / 文件（私有仓库没给令牌也会 404）',
         409: '仓库里已经有一个同名文件了',
-        422: 'GitHub 不接受这次提交（同名文件的 sha 对不上，重试一次多半就好）',
+        422: '不接受这次提交（同名文件的 sha 对不上，重试一次多半就好）',
+        451: '内容被平台审核挡下来了（raw 直链常见，走 API 就能绕开）',
     }
     hint = hints.get(code, '')
-    return 'GitHub 回了 %s%s%s' % (code, ('：%s' % detail) if detail else '',
-                                   ('（%s）' % hint) if hint else '')
+    return '%s 回了 %s%s%s' % (label, code, ('：%s' % detail) if detail else '',
+                               ('（%s）' % hint) if hint else '')
 
 
-def _api_raw(url, token='', method='GET', payload=None, timeout=API_TIMEOUT):
+def _api_raw(url, token='', method='GET', payload=None, timeout=API_TIMEOUT,
+             site=SITE_GITHUB):
     """
-    调一次 GitHub API。返回 (解析出来的内容, HTTP 状态码, 出错信息)。
+    调一次曲库 API。返回 (解析出来的内容, HTTP 状态码, 出错信息)。
 
+    GitHub / Gitee 的路径一样，区别在鉴权：GitHub 用 Authorization 头，
+    Gitee 读接口用 URL 上的 access_token、写接口放在 body 里。
     连不上那种（网络层）状态码给 0，调用方看状态码就知道「是没这个文件，还是网断了」。
     """
-    headers = {'User-Agent': USER_AGENT, 'Accept': 'application/vnd.github+json'}
+    label = 'Gitee' if site == SITE_GITEE else 'GitHub'
+    headers = {'User-Agent': USER_AGENT}
     body = None
+    query_token = ''
     if payload is not None:
+        payload = dict(payload)
+        if site == SITE_GITEE and token:
+            payload.setdefault('access_token', token)   # Gitee 写接口：令牌在 body 里
         body = json.dumps(payload).encode('utf-8')
         headers['Content-Type'] = 'application/json'
     if token:
-        headers['Authorization'] = 'Bearer %s' % token
+        if site == SITE_GITEE:
+            if payload is None:
+                query_token = token                      # Gitee 读接口：令牌在 URL 上
+        else:
+            headers['Authorization'] = 'Bearer %s' % token
+            headers['Accept'] = 'application/vnd.github+json'
+    if query_token:
+        sep = '&' if '?' in url else '?'
+        url = '%s%saccess_token=%s' % (url, sep, urllib.parse.quote(query_token))
     request = urllib.request.Request(_quote_url(url), data=body, headers=headers,
                                      method=method)
     try:
@@ -547,50 +793,56 @@ def _api_raw(url, token='', method='GET', payload=None, timeout=API_TIMEOUT):
         detail = ''
         try:
             got = json.loads(exc.read().decode('utf-8', 'replace') or '{}')
-            detail = str(got.get('message') or '')
+            detail = str(got.get('message') or got.get('error_description')
+                         or got.get('error') or '')
         except Exception:
             detail = ''
-        return None, exc.code, _api_error(exc.code, detail)
+        return None, exc.code, _api_error(site, exc.code, detail)
     except socket.timeout:
-        return None, 0, '连不上 GitHub（等超时了，网线 / 代理 / 需要梯子都有可能）'
+        return None, 0, '连不上 %s（等超时了，网线 / 代理 / 需要梯子都有可能）' % label
     except urllib.error.URLError as exc:
-        return None, 0, '连不上 GitHub：%s' % (getattr(exc, 'reason', None) or exc)
+        return None, 0, '连不上 %s：%s' % (label, getattr(exc, 'reason', None) or exc)
     except Exception as exc:                                # pragma: no cover
         return None, 0, '出错：%s' % exc
     try:
         return json.loads(raw.decode('utf-8', 'replace') or 'null'), 200, ''
     except ValueError:
-        return None, 200, 'GitHub 回的东西看不懂（不是 json）'
+        return None, 200, '%s 回的东西看不懂（不是 json）' % label
 
 
-def _api(url, token='', method='GET', payload=None, timeout=API_TIMEOUT):
+def _api(url, token='', method='GET', payload=None, timeout=API_TIMEOUT,
+         site=SITE_GITHUB):
     """跟 _api_raw 一样，只是不要状态码。"""
-    data, _code, why = _api_raw(url, token, method, payload, timeout)
+    data, _code, why = _api_raw(url, token, method, payload, timeout, site)
     return data, why
 
 
-def remote_sha(owner, repo, path, token='', ref=''):
+def remote_sha(site, owner, repo, path, token='', ref=''):
     """仓库里那个文件现在的 sha（用来覆盖提交）；没有这个文件就空字符串。"""
-    data, code, why = _api_raw(_contents_url(owner, repo, path, ref), token)
+    data, code, why = _api_raw(_contents_url(site, owner, repo, path, ref), token,
+                               site=site)
     if code == 404:
         return '', ''                      # 没有这个文件，正常
     if data is None:
         return '', why
     if isinstance(data, dict):
         return str(data.get('sha') or ''), ''
+    # Gitee 对「不存在的文件」不回 404，而是回一个空列表 —— 也算「没有这个文件」
+    if isinstance(data, list) and not data:
+        return '', ''
     return '', '文件列表看不懂（%s 多半是个目录）' % path
 
 
-def repo_files(owner, repo, ref, token='', timeout=API_TIMEOUT):
+def repo_files(site, owner, repo, ref, token='', timeout=API_TIMEOUT):
     """
     一次请求把仓库里所有文件列出来。返回 ([{path, size, sha}, ...], 出错信息)。
 
     注意这儿给的 sha 是 git 的 blob 校验值，不是文件内容的 sha1 —— 索引里那个
     sha1 得自己算（见 _sha1），所以只拿它来判断「文件变没变」。
     """
-    url = '%s/repos/%s/%s/git/trees/%s?recursive=1' % (GITHUB_API, owner, repo,
+    url = '%s/repos/%s/%s/git/trees/%s?recursive=1' % (_api_base(site), owner, repo,
                                                        urllib.parse.quote(str(ref)))
-    data, why = _api(url, token, timeout=timeout)
+    data, why = _api(url, token, timeout=timeout, site=site)
     if data is None:
         return [], why
     tree = data.get('tree') if isinstance(data, dict) else None
@@ -613,7 +865,7 @@ def is_midi(path):
     return str(path).lower().endswith(MIDI_SUFFIX)
 
 
-def put_file(owner, repo, path, data, token, message='', branch='', sha='',
+def put_file(site, owner, repo, path, data, token, message='', branch='', sha='',
              timeout=API_TIMEOUT):
     """
     把一个文件写进仓库（有就覆盖，得先给 sha）。返回 (网页地址, 出错信息)。
@@ -626,8 +878,10 @@ def put_file(owner, repo, path, data, token, message='', branch='', sha='',
         payload['branch'] = branch
     if sha:
         payload['sha'] = sha
-    got, why = _api(_contents_url(owner, repo, path), token, method='PUT',
-                    payload=payload, timeout=timeout)
+    # GitHub 新建 / 覆盖都用 PUT；Gitee 新建用 POST、覆盖才用 PUT
+    method = 'POST' if (site == SITE_GITEE and not sha) else 'PUT'
+    got, why = _api(_contents_url(site, owner, repo, path), token, method=method,
+                    payload=payload, timeout=timeout, site=site)
     if got is None:
         return '', why
     url = ''
@@ -636,10 +890,10 @@ def put_file(owner, repo, path, data, token, message='', branch='', sha='',
     return url, ''
 
 
-def _old_index_songs(owner, repo, branch, token, timeout=API_TIMEOUT):
+def _old_index_songs(site, owner, repo, branch, token, timeout=API_TIMEOUT):
     """把仓库里现有的 library.json 读回来（读不到就空表）：重排索引时靠它留住标题。"""
-    data, _code, _why = _api_raw(_contents_url(owner, repo, INDEX_NAME, branch),
-                                 token, timeout=timeout)
+    data, _code, _why = _api_raw(_contents_url(site, owner, repo, INDEX_NAME, branch),
+                                 token, timeout=timeout, site=site)
     if not isinstance(data, dict) or not data.get('content'):
         return {}
     try:
@@ -653,7 +907,7 @@ def _old_index_songs(owner, repo, branch, token, timeout=API_TIMEOUT):
 
 
 def refresh_index(owner, repo, branch, token='', known_sha1=None, timeout=API_TIMEOUT,
-                  meta=None):
+                  meta=None, site=SITE_GITHUB):
     """
     按仓库里现有的文件重新生成 library.json 并提交。返回 (说明, 出错信息)。
 
@@ -661,15 +915,17 @@ def refresh_index(owner, repo, branch, token='', known_sha1=None, timeout=API_TI
     的（= 刚传上来的新曲子）用 meta 里给的，再没有才拿文件名当标题。文件大小用
     仓库给的，sha1 沿用旧的（大小没变就说明内容没换），新传的那首由 known_sha1 直接给。
     """
-    token = str(token or '').strip() or get_token()
+    token = str(token or '').strip() or get_token(site)
     if not owner or not repo:
         return '', '不知道要写进哪个仓库'
     if not token:
-        return '', '程序里没有可用的 GitHub 令牌（打包时 github_token_local.py 没带上？）'
-    files, why = repo_files(owner, repo, branch, token, timeout=timeout)
+        return '', '程序里没有可用的%s令牌（打包时 %s 没带上？）' % (
+            'Gitee' if site == SITE_GITEE else 'GitHub',
+            'gitee_token_local.py' if site == SITE_GITEE else 'github_token_local.py')
+    files, why = repo_files(site, owner, repo, branch, token, timeout=timeout)
     if why:
         return '', why
-    old = _old_index_songs(owner, repo, branch, token, timeout=timeout)
+    old = _old_index_songs(site, owner, repo, branch, token, timeout=timeout)
     known_sha1 = dict(known_sha1 or {})
     meta = dict(meta or {})
     songs = []
@@ -677,6 +933,13 @@ def refresh_index(owner, repo, branch, token='', known_sha1=None, timeout=API_TI
         path = item['path']
         if not is_midi(path) or path.lower() == INDEX_NAME.lower():
             continue
+        if path not in known_sha1:
+            # 仓库的「文件列表」接口带缓存：刚删掉的文件，它过一会儿还照样列出来
+            # （Gitee / GitHub 都实测过）。挨个问一下「这个文件真的还在吗」，省得
+            # 索引里留下一条点不动的幽灵条目 —— 谁点了都只会白等到超时。
+            exists, why_check = remote_sha(site, owner, repo, path, token, branch)
+            if not why_check and not exists:
+                continue
         prev = old.get(path) or {}
         fresh = meta.get(path) or {}
         song = {
@@ -697,10 +960,11 @@ def refresh_index(owner, repo, branch, token='', known_sha1=None, timeout=API_TI
         return '', '这个仓库里一个 midi 都没有，没什么好写的'
     blob = json.dumps({'version': 1, 'songs': songs}, ensure_ascii=False,
                       indent=2).encode('utf-8')
-    sha, why = remote_sha(owner, repo, INDEX_NAME, token, branch)
+    sha, why = remote_sha(site, owner, repo, INDEX_NAME, token, branch)
     if why:
         return '', why
-    _url, why = put_file(owner, repo, INDEX_NAME, blob, token, branch=branch, sha=sha,
+    _url, why = put_file(site, owner, repo, INDEX_NAME, blob, token, branch=branch,
+                         sha=sha,
                          message='AutoPlay：更新曲库索引（%d 首）' % len(songs),
                          timeout=timeout)
     if why:
@@ -710,19 +974,22 @@ def refresh_index(owner, repo, branch, token='', known_sha1=None, timeout=API_TI
 
 
 def upload_song(local, title='', artist='', remote='', url=None, token='',
-                timeout=API_TIMEOUT):
+                timeout=API_TIMEOUT, site=''):
     """
     把一首 midi 传上曲库，然后重排索引。返回 (说明, 出错信息)。
 
     remote 不写就用本地文件名放到仓库根目录（索引里的 file 也是相对路径）。
     传上去 = 公开：这个仓库是开源共享曲库，所有人都看得到、下得走。
     """
-    owner, repo, branch, why = repo_of(url)
+    site2, owner, repo, branch, why = backend_of(url)
     if why:
         return '', why
-    token = str(token or '').strip() or get_token()
+    site = site or site2
+    token = str(token or '').strip() or get_token(site)
     if not token:
-        return '', '程序里没有可用的 GitHub 令牌（打包时 github_token_local.py 没带上？）'
+        return '', '程序里没有可用的%s令牌（打包时 %s 没带上？）' % (
+            'Gitee' if site == SITE_GITEE else 'GitHub',
+            'gitee_token_local.py' if site == SITE_GITEE else 'github_token_local.py')
     local = str(local or '')
     try:
         with open(local, 'rb') as handle:
@@ -732,10 +999,10 @@ def upload_song(local, title='', artist='', remote='', url=None, token='',
     remote = str(remote or '').strip().lstrip('/') or os.path.basename(local)
     if not is_midi(remote):
         remote += '.mid'
-    sha, why = remote_sha(owner, repo, remote, token, branch)
+    sha, why = remote_sha(site, owner, repo, remote, token, branch)
     if why:
         return '', why
-    pages, why = put_file(owner, repo, remote, data, token, branch=branch, sha=sha,
+    pages, why = put_file(site, owner, repo, remote, data, token, branch=branch, sha=sha,
                           message='AutoPlay：上传 %s' % os.path.basename(remote),
                           timeout=timeout)
     if why:
@@ -743,7 +1010,62 @@ def upload_song(local, title='', artist='', remote='', url=None, token='',
     told, why = refresh_index(owner, repo, branch, token,
                               known_sha1={remote: hashlib.sha1(data).hexdigest()},
                               timeout=timeout,
-                              meta={remote: {'title': title, 'artist': artist}})
+                              meta={remote: {'title': title, 'artist': artist}},
+                              site=site)
     if why:
         return '曲子传上去了（%s），但索引没更新：%s' % (remote, why), ''
     return '已上传 %s；%s' % (remote, told), ''
+
+
+def source_repo(site=None):
+    """某套曲库的仓库坐标（从它的默认索引地址里认出来）。返回 (owner, repo, branch, 出错信息)。"""
+    return repo_of(default_index_url(site or source_name()))
+
+
+def upload_song_all(local, title='', artist='', remote='', timeout=API_TIMEOUT,
+                    sites=None):
+    """
+    一次把一首曲子传到**所有**曲库（默认 Gitee + GitHub 都传）。返回 (说明, 出错信息)。
+
+    两边都成功才算成功；某一边没传成，不会连累另一边（成功的已经在仓库里了），
+    返回的文字里会分别写清楚两边的情况。
+    """
+    lines = []
+    ok = 0
+    tried = 0
+    for site in (sites or SITE_ORDER):
+        owner, repo, branch, why = source_repo(site)
+        if why:
+            lines.append('%s：跳过（%s）' % (SITE_LABELS.get(site, site), why))
+            continue
+        tried += 1
+        told, bad = upload_song(local, title, artist, remote, url=default_index_url(site),
+                                timeout=timeout, site=site)
+        if bad:
+            lines.append('%s：没传成（%s）' % (SITE_LABELS.get(site, site), bad))
+        else:
+            ok += 1
+            lines.append('%s：%s' % (SITE_LABELS.get(site, site), told))
+    if not tried:
+        return '', '两套曲库都没配地址，没地方传'
+    if ok:
+        return '\n'.join(lines), ''
+    return '', '\n'.join(lines)
+
+
+def refresh_index_all(timeout=API_TIMEOUT, sites=None):
+    """把每套曲库的索引都按仓库里的现有文件重排一遍。返回 (说明, 出错信息)。"""
+    lines = []
+    ok = 0
+    for site in (sites or SITE_ORDER):
+        owner, repo, branch, why = source_repo(site)
+        if why:
+            lines.append('%s：跳过（%s）' % (SITE_LABELS.get(site, site), why))
+            continue
+        told, bad = refresh_index(owner, repo, branch, timeout=timeout, site=site)
+        if bad:
+            lines.append('%s：没改成（%s）' % (SITE_LABELS.get(site, site), bad))
+        else:
+            ok += 1
+            lines.append('%s：%s' % (SITE_LABELS.get(site, site), told))
+    return '\n'.join(lines), ('' if ok else '一套都没排成')

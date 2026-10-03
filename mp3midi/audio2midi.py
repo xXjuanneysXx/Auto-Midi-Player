@@ -24,12 +24,17 @@
     python audio2midi.py 歌.mp3 -o 输出.mid
     python audio2midi.py 歌.mp3 --backend basic-pitch --min-note 0.12
 
+同音重复（连着弹好几下同一个音）最容易被并成一个长音，这里靠 basic-pitch 的起音
+把它们分开，见 _attack_marks / _has_attack；`--split-min` 是调这个的
+（`REPEAT_LEVELS` 是主程序那个「同音重复」敏感度滑块用的档位表）。
+
 注意：转写出来的「完整转谱」里同时响的音可能很多（钢琴 + 乐队就是这样），程序会
 按上面说的规则融合出一条单音主旋律 —— 想换成别的声部，可以在主程序里换音轨 / 重新转。
 `focus_melody`（截到 200~2000 Hz）是给兜底 YIN 用的老办法，默认不再开：
 那样会把低音和镲全砍掉，对真正的旋律提取没有好处。
 """
 
+import bisect
 import math
 import os
 import sys
@@ -57,6 +62,49 @@ BP_FRAME = 0.3            # 帧阈值
 BP_MIN_NOTE_MS = 58.0     # 比这还短的音直接不算（毫秒）
 BP_MIN_FREQ = 32.7        # 音域下限（C1）—— 不截频段，用模型自己的范围
 BP_MAX_FREQ = 1975.5      # 音域上限（B6，模型训练到这儿）
+
+# 「同音重复」和「一个长音被模型切成几段」在音符事件里长得一模一样 —— 两段的间隙
+# 实测都是 12 毫秒上下，光看时间是分不开的。唯一靠得住的区别是**起音**：重复弹的
+# 那一次带一个起音（basic-pitch 自己标出来的 onset），被切开的没有。下面这几个是
+# 拿起音去挡合并时的容差和门槛，想调同音重复就动 _SPLIT_MIN（命令行 --split-min）。
+ONSET_GUARD_BACK = 0.001  # 往回找的余量：接缝和起音本来是同一时刻，只有浮点误差
+ONSET_GUARD_FWD = 0.05    # 往接缝后面找这么久（起音有时比音头晚一两帧）
+ONSET_TOL_PITCH = 0       # 只在同一个音高上算起音（1 = 邻半音也算，更敏感也更容易误切）
+ONSET_CLUSTER = 0.05      # 挨得比这还近的起音算同一次起音（秒），见 _attack_marks
+ONSET_SPLIT_MIN = 0.20    # 同一个音高的起音，前后空不出这么久就不算「又弹了一下」（秒）。
+                          # 颤音 / 抖音（5~7 Hz）会让模型每 0.15 秒左右报一次起音，得比它
+                          # 宽一点才不会把长音切成好几段；真重复（16 分音符 150 BPM）也有
+                          # 0.1 秒，比这更密的重复音就得自己把 --split-min 调小。见 _attack_marks
+
+# 「同音重复」敏感度的档位表：主界面那个滑块用它（0 档 = 标准参数，不传额外参数）。
+# 档位越高 split_min / merge_gap 越小 —— 连着弹的同一个音越容易被切成好几个音，代价
+# 是颤音 / 抖音可能被切碎。命令行上等价于 --split-min / --merge-gap。
+# 故意不动 onset —— 起音阈值调小会多出一堆颤音起音，跟真起音挨得太近反而会被
+# _attack_marks 当成一串滤掉，重复音更容易被并。
+REPEAT_LEVELS = (
+    {'name': '标准', 'extra': {}},                                        # 0：默认那一套
+    {'name': '稍敏感', 'extra': {'split_min': 0.17, 'merge_gap': 0.07}},   # 1
+    {'name': '中等', 'extra': {'split_min': 0.14, 'merge_gap': 0.05}},     # 2
+    {'name': '较敏感', 'extra': {'split_min': 0.12, 'merge_gap': 0.04}},   # 3
+    {'name': '最敏感', 'extra': {'split_min': 0.09, 'merge_gap': 0.02}},   # 4
+)
+REPEAT_LEVEL_DEFAULT = 0
+
+# 老名字：等于滑块上「较敏感」那一档（老版本那个「同音重复更敏感」勾选框就是它）。
+# 命令行和老文档还在用它，留着别删。
+REPEAT_SENSITIVE = dict(REPEAT_LEVELS[3]['extra'])
+
+
+def repeat_level(index):
+    """滑块第几档 -> (档位名, 额外参数)。越界 / 不是数字都退回标准档。"""
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        index = REPEAT_LEVEL_DEFAULT
+    if not 0 <= index < len(REPEAT_LEVELS):
+        index = REPEAT_LEVEL_DEFAULT
+    item = REPEAT_LEVELS[index]
+    return item['name'], dict(item['extra'])
 
 # 融合主旋律时的「响度分档」粒度：同一档里比音高，差出一档才听响度。
 # 0.10 大致是「力度差不到 10% 就算一样响」。
@@ -268,12 +316,20 @@ def pyin_f0(path, sr=SR, progress=None):
     return f0.astype('float32')
 
 
-def basic_pitch_notes(path, progress=None):
+def basic_pitch_transcribe(path, progress=None, onset=BP_ONSET, frame=BP_FRAME,
+                           min_note_ms=BP_MIN_NOTE_MS):
     """
-    basic-pitch 多声部转写（保留每一处重叠，别丢音符）。
+    basic-pitch 多声部转写（保留每一处重叠，别丢音符），返回 (音符, 起音)。
 
-    返回 [(开始秒, 结束秒, MIDI 音高, 力度)]。整个转写过程都在 basic-pitch 自己
+    音符是 [(开始秒, 结束秒, MIDI 音高, 力度)]。整个转写过程都在 basic-pitch 自己
     那边完成：它是专门为「有伴奏的完整编曲」训练的模型，而不是先砍频段再猜基频。
+
+    起音是 [(秒, 音高)]，模型自己标的「这里新起了一个音」。后处理要靠它才能分清
+    「同一个音重复弹了几下」和「一个长音被模型切成了几段」：这两件事在音符事件里
+    长得一模一样（间隙都是十几毫秒），只有重复弹的那次带起音。见 _attack_marks。
+
+    onset 越小越敏感（重复音更容易被切开，也更容易听出毛刺）；frame 越小音越长；
+    min_note_ms 以下的音在 basic-pitch 里就不算了（毫秒）。
     """
     error = []
     module = _try_import('basic_pitch.inference', error)
@@ -283,9 +339,9 @@ def basic_pitch_notes(path, progress=None):
                            % (error[0] if error else '原因不明'))
     if progress:
         progress('用 basic-pitch 转写（Spotify 的开源模型，第一次会慢一点）…')
-    _model, _midi, events = module.predict(
-        str(path), onset_threshold=BP_ONSET, frame_threshold=BP_FRAME,
-        minimum_note_length=BP_MIN_NOTE_MS,
+    output, _midi, events = module.predict(
+        str(path), onset_threshold=onset, frame_threshold=frame,
+        minimum_note_length=min_note_ms,
         minimum_frequency=BP_MIN_FREQ, maximum_frequency=BP_MAX_FREQ)
     notes = []
     for event in events:
@@ -293,21 +349,132 @@ def basic_pitch_notes(path, progress=None):
         loud = float(event[3]) if len(event) > 3 else 1.0
         if stop > start and 0 < pitch < 128:
             notes.append((start, stop, pitch, loud))
+    onsets = _model_onsets(output, onset)
     if progress:
-        progress('basic-pitch 听出 %d 个音（含伴奏）' % len(notes))
-    return notes
+        progress('basic-pitch 听出 %d 个音（含伴奏）、%d 处起音' % (len(notes), len(onsets)))
+    return notes, onsets
 
 
-def _line(notes, key):
+def basic_pitch_notes(path, progress=None):
+    """只要音符（老接口）：[(开始秒, 结束秒, MIDI 音高, 力度)]。"""
+    return basic_pitch_transcribe(path, progress=progress)[0]
+
+
+def _model_onsets(output, thresh):
+    """
+    从模型的 onsets 矩阵里挑起音，返回 [(秒, 音高)]。
+
+    和 basic-pitch 内部（note_creation.output_to_notes_polyphonic 里那几步）用的是
+    同一份数据：先取「比左右两帧都高」的局部极大，再卡阈值。这里自己用 numpy 写，
+    是为了不多依赖一个 scipy，也免得跟着它的版本变。
+    """
+    if not isinstance(output, dict) or output.get('onset') is None:
+        return []
+    matrix = np.asarray(output['onset'], dtype='float32')
+    if matrix.ndim != 2 or not matrix.size:
+        return []
+    peaks = np.zeros_like(matrix, dtype=bool)
+    if len(matrix) > 2:
+        middle = matrix[1:-1]
+        peaks[1:-1] = (middle > matrix[:-2]) & (middle > matrix[2:])
+    points = np.zeros_like(matrix)
+    points[peaks] = matrix[peaks]
+    rows, cols = np.where(points >= thresh)
+    hop = _bp_hop_seconds()
+    offset = _bp_midi_offset()
+    return sorted((float(row) * hop, int(col) + offset) for row, col in zip(rows, cols))
+
+
+def _bp_hop_seconds():
+    """basic-pitch 一帧多少秒（问得到库就问，问不到按 22050 Hz / 256 样本算）。"""
+    constants = _try_import('basic_pitch.constants')
+    hop = getattr(constants, 'FFT_HOP', 256)
+    rate = getattr(constants, 'AUDIO_SAMPLE_RATE', 22050)
+    return float(hop) / float(rate)
+
+
+def _bp_midi_offset():
+    """模型输出第 0 个频点对应的音高（basic-pitch 里是 A0 = 21）。"""
+    module = _try_import('basic_pitch.note_creation')
+    return int(getattr(module, 'MIDI_OFFSET', 21))
+
+
+def _attack_marks(onsets, split_min=ONSET_SPLIT_MIN):
+    """
+    [(秒, 音高)] -> {音高: [秒, …]}：只留下「真的又弹了一下」的起音。
+
+    模型报出来的起音比真起音多得多，要筛两道才敢拿来当「同音重复」的分界：
+      ① 一个音头附近常报两三个挨着的峰，其实是同一次起音 —— 按 ONSET_CLUSTER 并成
+         一个，取最后一个峰（真起音在那个峰上）；
+      ② 颤音 / 抖音那种音一路报下去（本仓库的合成测试音就是每 0.1 秒报一次，强度
+         还不低），照它切会把一个音切成好几截 —— 只有前后都空出 split_min 的起音
+         才算「又弹了一下」。
+    筛完剩下这些时刻，就是可以拿来切同音重复的分界，见 _has_attack。
+    """
+    table = {}
+    for at, pitch in onsets or ():
+        table.setdefault(int(pitch), []).append(float(at))
+    marks = {}
+    for pitch, times in table.items():
+        times.sort()
+        groups = []                                       # 挨在一起的起音算一个音头
+        for at in times:
+            if groups and at - groups[-1][-1] < ONSET_CLUSTER:
+                groups[-1].append(at)
+            else:
+                groups.append([at])
+        peaks = [group[-1] for group in groups]
+        kept = []
+        for index, at in enumerate(peaks):
+            before = peaks[index - 1] if index else None
+            after = peaks[index + 1] if index + 1 < len(peaks) else None
+            if (before is None or at - before >= split_min) \
+                    and (after is None or after - at >= split_min):
+                kept.append(at)
+        marks[pitch] = kept
+    return marks
+
+
+def _has_attack(table, pitch, start, stop):
+    """
+    start~stop 这一小段里，同一个音高有没有**又弹一下**的分界。
+
+    有 = 这里真的重新弹了同一个音，不能并成一个长音；没有 = 多半是模型把长音切成
+    几段，可以并回去。窗口是「接缝到接缝后一点」（ONSET_GUARD_FWD：起音有时比音头
+    晚一两帧），往前只留 ONSET_GUARD_BACK 那么一丁点 —— 那点余量是给浮点误差的
+    （接缝和起音本来是同一个时刻，算出来的值差着最后几位），不是用来往前找的：
+    音尾那点地方冒出来的起音是模型在音的尾巴上抖了一下，往前找得多了就会把长音错
+    切成两段。
+    """
+    if not table:
+        return False
+    low = start - ONSET_GUARD_BACK
+    high = stop + ONSET_GUARD_FWD
+    for note in range(pitch - ONSET_TOL_PITCH, pitch + ONSET_TOL_PITCH + 1):
+        times = table.get(note)
+        if not times:
+            continue
+        index = bisect.bisect_left(times, low)
+        if index < len(times) and times[index] <= high:
+            return True
+    return False
+
+
+def _line(notes, key, onsets=None, split_min=ONSET_SPLIT_MIN):
     """
     多声部转写 -> 一条单线：每个时刻留下 key 最大的那个音。
 
     长音盖住一串短音、短音从长音中间穿过去，这里都能处理：按时间把所有音的开始 /
     结束排成队列扫一遍，每两个相邻的时间点之间记下「当时还响着的音里 key 最大的那个」。
     结果一定是单音、时间上不重叠。
+
+    onsets 是 basic-pitch 的起音（见 basic_pitch_transcribe）。两段同音高首尾相接时
+    本来会并成一个长音 —— 模型切开同音重复靠的就是这个「接缝」，所以接缝上真有起音
+    就不并，没有才并（长音被切成几段的情况）。判断见 _has_attack。
     """
     if not notes:
         return []
+    table = _attack_marks(onsets, split_min)
     events = []
     for index, (start, stop, pitch, _loud) in enumerate(notes):
         events.append((start, 1, index))             # 1 = 起头
@@ -320,7 +487,8 @@ def _line(notes, key):
         if at > previous:
             if active:
                 chosen = max(active.values())[1]     # key 最大那条线的音高
-                if spans and spans[-1][2] == chosen and spans[-1][1] >= previous - 1e-6:
+                if spans and spans[-1][2] == chosen and spans[-1][1] >= previous - 1e-6 \
+                        and not _has_attack(table, chosen, previous, previous):
                     spans[-1][1] = at
                 else:
                     spans.append([previous, at, chosen])
@@ -333,7 +501,7 @@ def _line(notes, key):
     return [tuple(span) for span in spans]
 
 
-def loud_line(notes):
+def loud_line(notes, onsets=None, split_min=ONSET_SPLIT_MIN):
     """
     主旋律候选 ①（默认用这条）：每个时刻取**最响**的那个音。
 
@@ -342,15 +510,15 @@ def loud_line(notes):
     霸占掉（实测有一首歌 22 秒的旋律被一个假的高音吃掉）。按力度挑就没这个问题：
     真正的主奏乐器在旋律上永远是响的那条。
     """
-    return _line(notes, lambda pitch, loud: (round(loud, 3), pitch))
+    return _line(notes, lambda pitch, loud: (round(loud, 3), pitch), onsets, split_min)
 
 
-def top_line(notes):
+def top_line(notes, onsets=None, split_min=ONSET_SPLIT_MIN):
     """主旋律候选 ②：每个时刻取**最高**的那个音（钢琴右手、弦乐主奏那种更准）。"""
-    return _line(notes, lambda pitch, loud: (pitch, round(loud, 3)))
+    return _line(notes, lambda pitch, loud: (pitch, round(loud, 3)), onsets, split_min)
 
 
-def fused_line(notes, step=FUSE_LOUD_STEP):
+def fused_line(notes, step=FUSE_LOUD_STEP, onsets=None, split_min=ONSET_SPLIT_MIN):
     """
     主旋律候选 ③（默认用这条）：把「最响」和「最高」两条线**合起来** —— 先比响度
     分档，同一档里再比音高。
@@ -363,38 +531,53 @@ def fused_line(notes, step=FUSE_LOUD_STEP):
     注意这不是把两条线拼起来：起点仍然是**原始的那堆音**，每个时刻只留一个，
     所以结果还是严格单音、绝不重叠。
     """
-    return _line(notes, lambda pitch, loud: (int(float(loud) / step), pitch))
+    return _line(notes, lambda pitch, loud: (int(float(loud) / step), pitch), onsets, split_min)
 
 
-def notes_from_spans(spans, min_note=MIN_NOTE, gap=NOTE_GAP, merge_gap=MERGE_GAP):
+def notes_from_spans(spans, min_note=MIN_NOTE, gap=NOTE_GAP, merge_gap=MERGE_GAP,
+                     onsets=None, split_min=ONSET_SPLIT_MIN):
     """
     [(开始, 结束, 音高)] -> [(开始秒, 持续秒, 音高)]。
 
     先并掉「同音高、中间只断了一小会儿」的两段（basic-pitch 会把一个长音切成几段），
     再剔掉太短的音和「夹在两个音中间、只差半音」的毛刺，最后给每个音留出 gap 秒的
     松开时间；出来的一定不重叠。
+
+    onsets 是 basic-pitch 的起音：接缝上有起音就不并 —— 「同一个音重复弹了几下」
+    才不会被并成一个长音（merge_gap 只管没有起音可看的那种情况）。
+    留 gap 也是为重复音好：两段同音高首尾相接时，演奏端（尤其游戏里）很容易把它
+    当成一个音连过去，中间空出一点才听得出来是两个音。
     """
-    merged = _merge_same(spans, merge_gap)
+    merged = _merge_same(spans, merge_gap, onsets, split_min)
     merged = [span for span in merged if span[1] - span[0] >= min_note]   # 太短的多半是毛刺
     merged = _drop_blips(merged)
-    merged = _merge_same(merged, merge_gap)      # 毛刺去掉以后，同音高的两段可能又挨上了
+    # 毛刺去掉以后，同音高的两段可能又挨上了
+    merged = _merge_same(merged, merge_gap, onsets, split_min)
     out = []
     for index, (start, stop, pitch) in enumerate(merged):
         finish = stop
         if index + 1 < len(merged):
             finish = min(finish, merged[index + 1][0])    # 绝不和下一个音重叠
-        out.append((start, max(finish - start, 0.02), pitch))
+        out.append((start, max(finish - start - gap, min(gap, finish - start)), pitch))
     return out
 
 
-def _merge_same(spans, merge_gap):
-    """同音高、中间只断了一小会儿的两段并成一个（模型会把长音切成几段）。"""
+def _merge_same(spans, merge_gap, onsets=None, split_min=ONSET_SPLIT_MIN):
+    """
+    同音高、中间只断了一小会儿的两段并成一个（模型会把长音切成几段）。
+
+    只在**没有起音**的地方并：断口上带着起音，那是同一个音重复弹了一下，得留着。
+    """
+    table = _attack_marks(onsets, split_min)
     out = []
     for start, stop, pitch in sorted(spans, key=lambda span: (span[0], span[2])):
-        if out and out[-1][2] == pitch and start - out[-1][1] <= merge_gap:
-            out[-1][1] = max(out[-1][1], stop)
-        else:
-            out.append([start, stop, pitch])
+        if out:
+            prev = out[-1]
+            if prev[2] == pitch and start - prev[1] <= merge_gap \
+                    and not _has_attack(table, pitch, prev[1], start):
+                prev[1] = max(prev[1], stop)
+                continue
+        out.append([start, stop, pitch])
     return out
 
 
@@ -589,7 +772,9 @@ def write_midi(notes, path, bpm=120.0, program=0, extra=None, name='melody'):
 # ============ 对外主函数 ============
 
 def convert(path, out=None, backend='auto', min_note=MIN_NOTE, gap=NOTE_GAP,
-            progress=None, bpm=120.0, focus=False, full=False):
+            progress=None, bpm=120.0, focus=False, full=False,
+            merge_gap=MERGE_GAP, onset=BP_ONSET, frame=BP_FRAME,
+            min_note_ms=BP_MIN_NOTE_MS, split_min=ONSET_SPLIT_MIN):
     """
     音频 -> MIDI，返回生成的 .mid 路径。
 
@@ -597,6 +782,11 @@ def convert(path, out=None, backend='auto', min_note=MIN_NOTE, gap=NOTE_GAP,
     focus=True 会先做一次「突出主旋律」的频段处理（只对兜底 YIN 有效，默认不开：
     那样等于把音域截到 200~2000 Hz，低音和镲全没了，对旋律提取没有好处）。
     full=True 时把「完整转谱（多音同时）」也写成第二条音轨（basic-pitch 后端才有）。
+
+    同音重复（连着弹好几下同一个音）被并成一个长音的话，调这几个：
+    onset 调小（起音更敏感，重复音更容易被切开）、merge_gap 调小（没有起音可看的
+    那种断口也别并）、gap 调大（两个同音高的音之间空得更开，演奏端更容易分开）、
+    split_min 调小（间隔更密的重复音也切开 —— 默认 0.15 秒是防颤音误切的）。
     """
     if not os.path.isfile(path):
         raise RuntimeError('找不到文件：%s' % path)
@@ -615,14 +805,18 @@ def convert(path, out=None, backend='auto', min_note=MIN_NOTE, gap=NOTE_GAP,
     if progress:
         progress('转换后端：%s' % chosen)
     polyphonic = []
+    onsets = []
     if chosen == 'pyin':
         f0 = pyin_f0(path, progress=progress)
-        notes = notes_from_f0(f0, min_note=min_note, gap=gap)
+        notes = notes_from_f0(f0, min_note=min_note, gap=gap, merge_gap=merge_gap)
     elif chosen == 'basic-pitch':
-        polyphonic = basic_pitch_notes(path, progress=progress)
+        polyphonic, onsets = basic_pitch_transcribe(
+            path, progress=progress, onset=onset, frame=frame, min_note_ms=min_note_ms)
         if not polyphonic:
             raise RuntimeError('这段音频里没听出任何音符')
-        melody = notes_from_spans(fused_line(polyphonic), min_note=min_note, gap=gap)
+        melody = notes_from_spans(fused_line(polyphonic, onsets=onsets, split_min=split_min),
+                                  min_note=min_note, gap=gap, merge_gap=merge_gap,
+                                  onsets=onsets, split_min=split_min)
         if progress:
             progress('从 %d 个音里融合出一条主旋律（先比响度、同档再比音高）：%d 个音'
                      % (len(polyphonic), len(melody)))
@@ -636,15 +830,16 @@ def convert(path, out=None, backend='auto', min_note=MIN_NOTE, gap=NOTE_GAP,
                 progress('突出主旋律频段：%d~%d Hz' % (MELODY_LOW, MELODY_HIGH))
             mono = focus_melody(mono, sr)
         f0 = yin_f0(mono, sr, progress=progress)
-        notes = notes_from_f0(f0, min_note=min_note, gap=gap)
+        notes = notes_from_f0(f0, min_note=min_note, gap=gap, merge_gap=merge_gap)
     if not notes:
         raise RuntimeError('没听出任何音高：这段音频可能太吵、太安静或者不是单声部旋律')
     extra = []
     if polyphonic:
         # 两条原始候选也留着（跟融合出来的那条不一样才写），想 A/B 对比就在主程序里换音轨
-        for title, spans in (('melody2 loud', loud_line(polyphonic)),
-                             ('melody3 high', top_line(polyphonic))):
-            other = notes_from_spans(spans, min_note=min_note, gap=gap)
+        for title, spans in (('melody2 loud', loud_line(polyphonic, onsets, split_min)),
+                             ('melody3 high', top_line(polyphonic, onsets, split_min))):
+            other = notes_from_spans(spans, min_note=min_note, gap=gap, merge_gap=merge_gap,
+                                     onsets=onsets, split_min=split_min)
             if other and other != notes:
                 extra.append((title, _flatten(other), 0))
                 if progress:
@@ -686,7 +881,24 @@ def main(argv=None):
     parser.add_argument('--min-note', type=float, default=MIN_NOTE,
                         help='最短音长（秒），默认 %.2f' % MIN_NOTE)
     parser.add_argument('--gap', type=float, default=NOTE_GAP,
-                        help='每个音结尾留的松开时间（秒），默认 %.2f' % NOTE_GAP)
+                        help='每个音结尾留的松开时间（秒），默认 %.2f；'
+                             '两个同音高的音容易被当成一个音连过去，就是留得不够' % NOTE_GAP)
+    parser.add_argument('--merge-gap', type=float, default=MERGE_GAP,
+                        help='同音高的两段断开不到这么久就当同一个音（秒），默认 %.2f；'
+                             '想更容易听出重复音就调小' % MERGE_GAP)
+    parser.add_argument('--onset', type=float, default=BP_ONSET,
+                        help='basic-pitch 起音阈值，默认 %.2f；调小会多听出一些起音'
+                             '（也包括毛刺）。它跟「重复音切不切得开」不是一回事，'
+                             '想切重复音请用 --split-min' % BP_ONSET)
+    parser.add_argument('--frame', type=float, default=BP_FRAME,
+                        help='basic-pitch 帧阈值，默认 %.2f；越小音越长' % BP_FRAME)
+    parser.add_argument('--min-note-ms', type=float, default=BP_MIN_NOTE_MS,
+                        help='basic-pitch 里比这还短的音直接不算（毫秒），默认 %.0f'
+                             % BP_MIN_NOTE_MS)
+    parser.add_argument('--split-min', type=float, default=ONSET_SPLIT_MIN,
+                        help='同一个音高的起音，前后空不出这么久就不算「又弹了一下」（秒），'
+                             '默认 %.2f；重复音太密被并掉就调小，颤音多的曲子被切碎就调大'
+                             % ONSET_SPLIT_MIN)
     parser.add_argument('--melody-focus', action='store_true',
                         help='（只对兜底 yin 有效）先把频段截到 200~2000 Hz，默认不开')
     parser.add_argument('--full', action='store_true',
@@ -695,7 +907,9 @@ def main(argv=None):
     try:
         out = convert(args.audio, args.out, args.backend, args.min_note, args.gap,
                       progress=lambda text: print(text),
-                      focus=args.melody_focus, full=args.full)
+                      focus=args.melody_focus, full=args.full,
+                      merge_gap=args.merge_gap, onset=args.onset, frame=args.frame,
+                      min_note_ms=args.min_note_ms, split_min=args.split_min)
     except RuntimeError as exc:
         print('转换失败：%s' % exc)
         return 1

@@ -71,6 +71,7 @@ def score_data(score):
         'track_index': int(getattr(score, 'track_index', -1)),
         'track_name': getattr(score, 'track_name', '') or '',
         'autosave': True,
+        'length': round(float(getattr(score, 'length', 0.0)), 4),
         'notes': [[round(note.start, 4), round(note.dur, 4), int(note.pitch)]
                   for note in score.ordered()],
     }
@@ -85,7 +86,8 @@ def signature(score):
     """
     notes = tuple((round(note.start, 4), round(note.dur, 4), int(note.pitch))
                   for note in score.ordered())
-    return hash((int(score.tonic), round(float(score.bpm), 3), notes))
+    return hash((int(score.tonic), round(float(score.bpm), 3),
+                 round(float(getattr(score, 'length', 0.0)), 4), notes))
 
 
 def _remove_file(path):

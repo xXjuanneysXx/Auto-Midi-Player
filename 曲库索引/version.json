@@ -1,0 +1,15 @@
+{
+  "format": "autoplay-version",
+  "version": 1,
+  "latest": "1.0.3",
+  "min_supported": "1.0.2",
+  "published": "2026-10-03",
+  "notes": "新增增量更新，优化了曲库读取逻辑，修复了联网曲库加载慢的问题，优化了编辑器的编辑逻辑",
+  "links": {
+    "bilibili": "https://space.bilibili.com/341688158",
+    "github": "https://github.com/xXjuanneysXx/Auto-Midi-Player",
+    "download_page": "https://space.bilibili.com/341688158",
+    "library": "https://gitee.com/juanneys/midi-music"
+  },
+  "update_manifest": "update.json"
+}

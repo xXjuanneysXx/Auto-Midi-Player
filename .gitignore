@@ -1,0 +1,63 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# PyInstaller 构建产物（体积大，可由 build.bat 重新生成）
+build/
+dist/
+dist_new/
+FollowPlay/
+FollowPlayNew/
+FollowPlayTmp/
+v1.0备份/
+FollowPlayOld/
+
+# 程序生成的简谱文件（可随时由 MIDI 重新生成）
+TONIC*.txt
+
+# 音频转出来的 midi 测试产物
+mp3midi/测试/*.mid
+
+# 崩溃转储 / 日志
+*.dmp
+error.log
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# 编辑器打包产物（build_editor.bat 生成）
+EditorPlay/
+EditorPlayTmp/
+# 安装包产物（build_installer.bat / make_installer.py 生成）
+发布/
+dist_installer/
+build_installer/
+AutoPlay.ico
+payload*.zip
+# 精简版的打包产物
+dist_lite/
+build_lite/
+
+# 增量更新的产物（基准清单 / 差分包 / update.json，发版时生成、传上去用，体积不小）
+更新包/
+
+# 内置的 GitHub 令牌（只在这台机器 / 自己打的包里，绝不进 git）
+github_token_local.py
+
+# 内置的 Gitee 令牌（同上，绝不进 git）
+gitee_token_local.py
+
+# 整理出来准备推到 GitHub 的那一份源码（它自己是独立的一份，不进本仓库）
+开源发布/
+
+# ⚠ 上传口令（中转那边的 UPLOAD_KEY）
+#
+# 和下面那个令牌一个道理：它是密密，别提交。代码里读得到就用，
+# 读不到就当没配（程序照常跑）。
+relay_key_local.py
+
+# 中转配置的备份（下面那个 relay_key_local.py 的副本，含口令）
+中转配置备份/

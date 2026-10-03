@@ -93,6 +93,12 @@ tflite 没装的 WARNING，那是它在说「我要走 ONNX 那条路」，属�
 - 转出来的音数一般比原曲「听起来」多不少（伴奏、装饰音都会被记下来）：手动挑主旋律是
   研究界的老大难问题，这个程序用的是「响度分档 + 音高」这个朴素规则，所以务必先按
   「♪ 试听」听一遍，不对就在音轨下拉框里换另一条（`melody2 loud` / `melody3 high`）。
+- 连着弹好几下同一个音（同音重复）有可能被并成一个长音。两段同音高的音之间的空隙只有
+  十几毫秒时，光看时间是分不出「模型把一个长音切成了几段」还是「真的重复弹了」的 ——
+  程序看的是 basic-pitch 的**起音**：有起音才当成又弹了一下。要是还是被并掉，主程序里
+  把「同音重复」那个滑块往右拉（标准 → 稍敏感 → 中等 → 较敏感 → 最敏感）再点「应用」
+  重转；命令行上就把 `--split-min` 调小（0.20 → 0.12）、`--onset` 调小（0.5 → 0.35）
+  试试。反过来颤音多的曲子被切碎了，就往左拉回来 / 把 `--split-min` 调大。
 
 ## 文件
 
@@ -108,3 +114,13 @@ tflite 没装的 WARNING，那是它在说「我要走 ONNX 那条路」，属�
     python audio2midi.py 歌.mp3 -o 输出.mid --min-note 0.12
     python audio2midi.py 歌.mp3 --backend yin          # 兜底算法（单声部音频）
     python audio2midi.py 歌.mp3 --melody-focus         # 兜底 yin 才有效：先截到 200~2000 Hz
+
+同音重复被并成一个长音时（基本都用 basic-pitch 那条）。主程序里那个「同音重复」滑块
+就是把 `--split-min` / `--merge-gap` 打包成了 5 档（`REPEAT_LEVELS`，见 `repeat_level()`）；
+下面这几个还能手动微调：
+
+    python audio2midi.py 歌.mp3 --split-min 0.12       # 间隔更密的重复音也切开（默认 0.20）
+    python audio2midi.py 歌.mp3 --onset 0.35           # 起音更敏感（默认 0.50）
+    python audio2midi.py 歌.mp3 --merge-gap 0.04       # 没起音可看的断口也别并（默认 0.10）
+    python audio2midi.py 歌.mp3 --gap 0.06             # 两个音之间空得更开（默认 0.03）
+    python audio2midi.py 歌.mp3 --backend yin --merge-gap 0.02   # 兜底 yin / pyin 单声部音频
