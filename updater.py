@@ -12,7 +12,9 @@ AutoPlay 增量更新器
     等主程序退出（等它带上来的 --pid）
       -> 读差分包里的 _patch\manifest.json（哪些文件该是什么 sha256、哪些删掉）
       -> 把要被覆盖 / 删掉的文件先备份到临时目录
-      -> 逐个覆盖（写一个核一个 sha256，全对才往下走）
+      -> 逐个覆盖（写一个核一个 sha256，全对才往下走；给了好几个包就按顺序
+         一个一个盖 —— 多跳增量：手上这版没有直达最新版的包，客户端会把
+         一跳一跳的包串起来一起给过来）
       -> 删掉新版本里没有的文件
       -> 成了：删备份、把主程序重新拉起来
          败了：用备份原样还原、把新加的文件删掉、把主程序拉起来、弹一句说明
@@ -21,6 +23,8 @@ AutoPlay 增量更新器
 
     AutoPlayUpdater.exe --patch <差分包.zip> --target <安装目录> --version 1.0.3 ^
         --exe AutoPlay.exe --pid 1234 --timeout 300 --relaunch
+    # 多个包（按给的顺序依次盖上去）：
+    AutoPlayUpdater.exe --patch a.zip --patch b.zip --target <安装目录> ...
 
 日志写在两处：`%TEMP%\AutoPlayUpdate\updater.log`（这个跑完还在，方便排查）和
 `%LOCALAPPDATA%\AutoPlay\AutoPlay.log`（跟主程序一份，用户看日志就能看到更新过程）。
@@ -292,7 +296,8 @@ def apply_patch(zip_path, target, manifest):
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description='AutoPlay 增量更新器')
-    parser.add_argument('--patch', required=True, help='差分包 zip 的路径')
+    parser.add_argument('--patch', required=True, action='append', metavar='ZIP',
+                        help='差分包 zip 的路径；给多个就按给的顺序依次盖上去')
     parser.add_argument('--target', required=True, help='安装目录')
     parser.add_argument('--version', default='', help='要升到的版本号')
     parser.add_argument('--exe', default='AutoPlay.exe', help='主程序文件名')
@@ -307,15 +312,18 @@ def main(argv):
     args = parse_args(argv)
     _SILENT[0] = bool(args.silent)
     target = os.path.abspath(args.target)
+    patch_paths = [str(path) for path in (args.patch or []) if str(path or '').strip()]
     log('=' * 60)
-    log('开始增量更新：包=%s，安装目录=%s，目标版本=%s，主程序 pid=%d'
-        % (args.patch, target, args.version or '?', args.pid))
+    log('开始增量更新：%d 个包（%s），安装目录=%s，目标版本=%s，主程序 pid=%d'
+        % (len(patch_paths), '、'.join(os.path.basename(path) for path in patch_paths),
+           target, args.version or '?', args.pid))
 
-    if not os.path.isfile(args.patch):
-        log('差分包不存在，退出')
-        message('差分包不见了：\n%s\n\n这次不更新了，可以回程序里重新点一次。' % args.patch,
-                MB_ICONERROR)
-        return 1
+    for path in patch_paths:
+        if not os.path.isfile(path):
+            log('差分包不存在：%s，退出' % path)
+            message('差分包不见了：\n%s\n\n这次不更新了，可以回程序里重新点一次。' % path,
+                    MB_ICONERROR)
+            return 1
     if not os.path.isdir(target):
         log('安装目录不存在，退出')
         message('安装目录不见了：\n%s' % target, MB_ICONERROR)
@@ -326,23 +334,42 @@ def main(argv):
         stop_running(target, args.exe)
         time.sleep(1.5)
 
-    manifest, why = read_patch(args.patch)
-    if why:
-        log('包读不了：%s' % why)
-        message('这次更新失败：%s\n\n可以去下载页下完整安装包（装的时候会覆盖旧版）。' % why,
-                MB_ICONERROR)
-        if args.relaunch:
-            relaunch(target, args.exe)
-        return 1
-    to_version = str(manifest.get('to') or args.version or '')
-    log('清单好了：要换 %d 个文件，删 %d 个'
-        % (len(manifest.get('files') or {}), len(manifest.get('removed') or [])))
+    packs = []
+    for path in patch_paths:
+        manifest, why = read_patch(path)
+        if why:
+            log('包读不了（%s）：%s' % (os.path.basename(path), why))
+            message('这次更新失败：%s\n\n可以去下载页下完整安装包（装的时候会覆盖旧版）。' % why,
+                    MB_ICONERROR)
+            if args.relaunch:
+                relaunch(target, args.exe)
+            return 1
+        packs.append((path, manifest))
+    to_version = str(packs[-1][1].get('to') or args.version or '')
+    log('清单好了：%d 个包，一共要换 %d 个文件、删 %d 个'
+        % (len(packs), sum(len(m.get('files') or {}) for _p, m in packs),
+           sum(len(m.get('removed') or []) for _p, m in packs)))
 
     backup_dir = tempfile.mkdtemp(prefix='AutoPlayBackup-')
-    touched = list(manifest.get('files') or {}) + list(manifest.get('removed') or [])
-    saved = backup(target, [normalize(rel) for rel in touched], backup_dir)
+    touched, seen = [], set()
+    for _path, manifest in packs:
+        for rel in list(manifest.get('files') or {}) + list(manifest.get('removed') or []):
+            rel = normalize(rel)
+            if rel and rel not in seen:
+                seen.add(rel)
+                touched.append(rel)
+    saved = backup(target, touched, backup_dir)
     log('备份了 %d 个文件到 %s' % (len(saved), backup_dir))
-    written, why = apply_patch(args.patch, target, manifest)
+
+    written, why = [], ''
+    for index, (path, manifest) in enumerate(packs, 1):
+        if len(packs) > 1:
+            log('盖第 %d/%d 个包：v%s -> v%s'
+                % (index, len(packs), manifest.get('from') or '?', manifest.get('to') or '?'))
+        got, why = apply_patch(path, target, manifest)
+        written.extend(got)
+        if why:
+            break
     if why:
         log('更新失败：%s —— 开始还原' % why)
         restore(target, backup_dir, saved, [rel for rel in written

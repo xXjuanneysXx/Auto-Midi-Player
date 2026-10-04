@@ -106,6 +106,30 @@ def _draw_github(p, q, color):
     p.drawLine(q['QPointF'](13.0, 16.0), q['QPointF'](12.0, 16.8))
 
 
+def _draw_reward(p, q, color):
+    """打赏：一颗心（最简单也最好认）。"""
+    p.setPen(q['Qt'].NoPen)
+    p.setBrush(q['QBrush'](color))
+    path = q['QPainterPath']()
+    path.moveTo(12.0, 19.6)
+    path.cubicTo(4.2, 14.4, 2.6, 10.4, 4.6, 7.2)
+    path.cubicTo(6.5, 4.3, 10.2, 4.7, 12.0, 7.6)
+    path.cubicTo(13.8, 4.7, 17.5, 4.3, 19.4, 7.2)
+    path.cubicTo(21.4, 10.4, 19.8, 14.4, 12.0, 19.6)
+    path.closeSubpath()
+    p.drawPath(path)
+
+
+def _draw_search(p, q, color):
+    """搜索：一个放大镜（圆 + 手柄）。"""
+    pen = q['QPen'](color, 2.1)
+    pen.setCapStyle(q['Qt'].RoundCap)
+    p.setPen(pen)
+    p.setBrush(q['Qt'].NoBrush)
+    p.drawEllipse(q['QPointF'](10.6, 10.6), 5.4, 5.4)
+    p.drawLine(q['QPointF'](14.7, 14.7), q['QPointF'](19.6, 19.6))
+
+
 # 眼睛那种「挖洞」没法真的挖（图标是透明的），所以拿一个和主色反着来的颜色顶上
 _hint = {'color': '#ffffff'}
 
@@ -126,6 +150,8 @@ DRAWERS = {
     'update': _draw_update,
     'bilibili': _draw_bilibili,
     'github': _draw_github,
+    'reward': _draw_reward,
+    'search': _draw_search,
 }
 
 SCALE = 3.0                     # 先在 3 倍尺寸上画，缩下来更干净

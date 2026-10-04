@@ -115,6 +115,23 @@ MIDI_SUFFIX = ('.mid', '.midi')
 # 用户点它只会白等到超时，看着就像程序卡死。拉歌单时顺手滤掉，不用等索引重排。
 HIDDEN_SONGS = ('邓垚 - 诀别书',)
 
+# 曲库仓库里跟曲子无关的元文件（索引 / 公告 / 版本 / 更新清单 / 错误上报配置）。
+# 正常它们不会出现在 library.json 的 songs 里，但万一手滑写进去，这里兜一层：
+# 别把 error_report.json 这种配置当成曲子解析出来。
+META_FILES = ('library.json', 'notice.json', 'version.json', 'update.json',
+              'themes.json', 'error_report.json')
+ERROR_REPORT_DIR = '错误报告'
+
+
+def is_meta_path(path):
+    """这个索引路径是不是曲库仓库的元文件（是就别当曲子）。"""
+    text = str(path or '').replace('\\', '/').strip().lower()
+    if not text:
+        return True
+    if text.rsplit('/', 1)[-1] in META_FILES:
+        return True
+    return ERROR_REPORT_DIR in text
+
 
 def is_hidden(song):
     """这首歌在不在下架名单里。"""
@@ -256,14 +273,18 @@ def set_source_url(url):
         return False
 
 
-def mirrors(url):
+def mirror_urls(url):
     """
-    同一个东西可以试的几个地址。
+    除了原地址，还能从哪些镜像拿（现在只有 GitHub raw -> jsDelivr 这一条）。
 
-    GitHub 的 raw 在国内经常连不上，所以给 raw 地址自动补一个 jsDelivr 的镜像
-    （同一个仓库、同一个文件，CDN 分发，一般能通）。列表里的顺序就是尝试顺序。
+    ⚠ jsDelivr 对「分支地址」（@main / @master）是**长缓存**：实测 12 小时
+    （响应头 s-maxage=43200），而且**查询串不参与它的缓存键** —— 加 ?_=时间戳
+    一点用都没有（实测三个不同 ?_ 的地址回的是同一份副本）。
+    所以「会变的内容」（version.json / notice.json / update.json / library.json
+    这些索引 json）不能把镜像当第一选择：调 _try_all 时带 mirror=False，
+    镜像只留作最后的兜底。midi 那种传上去就不太动的二进制文件用镜像没问题。
     """
-    out = [url]
+    out = []
     try:
         parts = urllib.parse.urlsplit(url)
     except ValueError:
@@ -275,6 +296,16 @@ def mirrors(url):
             rest = '/'.join(bits[3:])
             out.append('https://cdn.jsdelivr.net/gh/%s/%s@%s/%s' % (user, repo, branch, rest))
     return out
+
+
+def mirrors(url):
+    """
+    同一个东西可以试的几个地址：第一个是原地址，后面是镜像。
+
+    GitHub 的 raw 在国内经常连不上，所以给 raw 地址自动补一个 jsDelivr 的镜像
+    （同一个仓库、同一个文件，CDN 分发，一般能通）。列表里的顺序就是尝试顺序。
+    """
+    return [url] + mirror_urls(url)
 
 
 def _quote_url(url):
@@ -302,15 +333,17 @@ def _get(url, timeout):
         return response.read()
 
 
-def _try_all(url, timeout, what, total=None):
+def _try_all(url, timeout, what, total=None, mirror=True):
     """
     挨个试镜像，成功就返回 (内容, 出错信息)。
 
     timeout 是「每个地址最多等多久」，total 是「这一轮总共最多等多久」—— 不能几个
     镜像各等一遍（两个地址就翻倍，用户会觉得界面卡死了）。total 不写就按「每个地址
     各等一遍」来，给「拉索引」那种本来就要多试几个地址的场合留余地。
+    mirror=False 就只试原地址 —— 拉会变的 json 时这么用（镜像有 12 小时长缓存，
+    而且查询串不进它的缓存键，见 mirror_urls）。
     """
-    candidates = list(mirrors(url))
+    candidates = list(mirrors(url)) if mirror else [url]
     budget = float(total) if total else float(timeout) * max(1, len(candidates))
     deadline = time.monotonic() + max(1.0, budget)
     last = ''
@@ -352,7 +385,7 @@ def parse_index(text):
         if not isinstance(item, dict):
             continue
         path = str(item.get('file') or item.get('path') or '').strip()
-        if not path:
+        if not path or is_meta_path(path):
             continue
         song = {
             'title': str(item.get('title') or os.path.splitext(os.path.basename(path))[0]),
@@ -447,8 +480,13 @@ def songs_from_gitee(url=None, timeout=INDEX_TIMEOUT):
     if why:
         return [], why
     api = _contents_url(site, owner, repo, INDEX_NAME, branch)
+    # 读接口也要带令牌：Gitee 的 contents 匿名调会 403（实测），不带令牌这里就
+    # 永远拿不到索引，只能退回本地缓存 / 列仓库，看着就像「打不开、加载很慢」。
+    token = get_token(site)
     # 这里是「打开窗口就要等」的那一下，超时按索引那套来（几秒），不能按上传那套的 30 秒
-    data, code, why_read = _api_raw(api, '', timeout=max(float(timeout or 0), INDEX_TIMEOUT))
+    data, code, why_read = _api_raw(api, token,
+                                    timeout=max(float(timeout or 0), INDEX_TIMEOUT),
+                                    site=site)
     if isinstance(data, dict) and data.get('content'):
         try:
             text = base64.b64decode(data['content']).decode('utf-8', 'replace')
@@ -460,7 +498,7 @@ def songs_from_gitee(url=None, timeout=INDEX_TIMEOUT):
         why_read = '索引文件看不懂（应该是一个 json：{"songs": [...]}）'
     elif code == 404:
         why_read = ''
-    songs, why2 = songs_from_repo(url, timeout, site=site)
+    songs, why2 = songs_from_repo(url, timeout, site=site, token=token)
     if songs:
         return songs, ''
     return [], why_read or why2
@@ -473,7 +511,8 @@ def fetch_index(url=None, timeout=INDEX_TIMEOUT):
     出错分两种，调用方看歌单是不是空的就知道了：网断了 -> 空歌单 + 一句话；
     拉到了 -> 歌单 + 空字符串。拉到的会顺手存一份当缓存。
 
-    按地址认站点：Gitee 走 API（raw 会被内容审核挡），GitHub 走 raw + jsDelivr 镜像。
+    按地址认站点：Gitee 走 API（raw 会被内容审核挡），GitHub 走 raw（不带镜像）+
+    contents API 兜底 —— 索引这种会变的内容不能走 jsDelivr 镜像，它是 12 小时长缓存。
     索引拉不到（仓库里还没有 library.json）或者根本不是 json 时，会自动退到
     songs_from_repo()：直接列仓库里的 midi 当歌单。所以「只丢 midi 不写索引」
     的仓库照样能用。
@@ -490,10 +529,17 @@ def fetch_index(url=None, timeout=INDEX_TIMEOUT):
         if songs:
             save_index(songs)
         return songs, why
-    raw, why = _try_all(url, timeout, '索引')
+    # GitHub 这边 raw 先试，但**不带 jsDelivr 镜像**：它对分支地址缓存 12 小时，
+    # 而且查询串不进缓存键，索引从它那儿拿就是旧的。
+    raw, why = _try_all(url, timeout, '索引', mirror=False)
     songs = None
     if raw is not None:
         songs = parse_index(raw.decode('utf-8', 'replace'))
+    if songs:
+        save_index(songs)
+        return songs, ''
+    # raw 连不上 / 拿回来是网页：走 contents API（带内置令牌，内容是实时的）
+    songs, why_api = songs_from_gitee(url, timeout)
     if songs:
         save_index(songs)
         return songs, ''
@@ -503,7 +549,7 @@ def fetch_index(url=None, timeout=INDEX_TIMEOUT):
         save_index(fallback)
         return fallback, ''
     if raw is None:
-        return [], why2 or why
+        return [], why2 or why_api or why
     return [], '索引文件看不懂（应该是一个 json：{"songs": [...]}）'
 
 

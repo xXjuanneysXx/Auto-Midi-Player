@@ -1,0 +1,10 @@
+{
+  "format": "autoplay-error-report",
+  "enabled": true,
+  "site": "gitee",
+  "owner": "juanneys",
+  "repo": "midi-music",
+  "branch": "master",
+  "dir": "错误报告",
+  "note": "程序没接住的异常会自动打包成 json 传到 dir 这个目录，方便作者定位问题。只传版本 / 系统 / 异常类型 / 调用栈（路径会换成 <path>）/ 路径里有没有中文；不传用户名、完整路径、歌名。"
+}

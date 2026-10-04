@@ -1,23 +1,23 @@
 {
   "format": "autoplay-update",
-  "generated": "2026-10-03 22:27:09",
-  "latest": "1.0.3",
-  "min_supported": "1.0.2",
-  "notes": "新增增量更新，优化了曲库读取逻辑，修复了联网曲库加载慢的问题，优化了编辑器的编辑逻辑",
+  "generated": "2026-10-05 03:52:58",
+  "latest": "1.0.7",
+  "min_supported": "1.0.3",
+  "notes": "1. 新增多跳增量更新与累积差分包：1.0.3 起的老版本不用再重下整个安装包，一跳或几跳就能升上来。\n2. 试听跟着「速度」走：调倍速时试听同步变速，听到一半换速度会从当前位置接着放。\n3. 曲库加了搜索栏：按曲名 / 歌手过滤，命中的那一段高亮，可切正则匹配。\n4. 新增出错自动上报（默认开，可关）：出问题时自动把脱敏后的错误信息传到 Gitee，方便定位。\n5. 新增「打赏作者」按钮；公告 / 更新 / 打赏这几个窗口现在压得住置顶的主窗口。\n6. 修「缺运行库启动失败」：VC 运行库随安装包一起带上，干净系统不用自己装。\n7. 修复联网曲库加载慢、以及把版本信息等元文件当曲子解析的问题。\n8. 优化了界面布局相互挤压的问题。",
   "editions": {
     "full": {
       "label": "完全版",
-      "version": "1.0.3",
+      "version": "1.0.7",
       "package": {
-        "url": "https://github.com/xXjuanneysXx/Auto-Midi-Player/releases/download/v1.0.3/AutoPlay%20%E5%AE%8C%E5%85%A8%E7%89%88%20%E5%AE%89%E8%A3%85%E7%A8%8B%E5%BA%8F%20v1.0.3.exe",
-        "size": 231678898,
-        "sha256": "2dcbac73557df56c33092e5b5d63a99f6681f7a2751ac5fafca45efaa4f148a5"
+        "url": "https://github.com/xXjuanneysXx/Auto-Midi-Player/releases/download/v1.0.7/AutoPlay%20%E5%AE%8C%E5%85%A8%E7%89%88%20%E5%AE%89%E8%A3%85%E7%A8%8B%E5%BA%8F%20v1.0.7.exe",
+        "size": 232132796,
+        "sha256": "9be02b5e3d4b29ed5d75c3deca43313ac1d5fb020b07b3ca4d91e1804d10b0e9"
       },
       "files": [
         {
           "path": "AutoPlay.exe",
-          "size": 22285871,
-          "sha256": "f2e6bb97c3fdf9afa35ecf04a71f753defa7b1c747584ecda6de12424fdce8f7"
+          "size": 22323710,
+          "sha256": "4df215f84b7fc862968ce6cd16d54c3637e82b1a4de85463b10525be27a7229e"
         },
         {
           "path": "AutoPlay.ico",
@@ -26,8 +26,8 @@
         },
         {
           "path": "AutoPlayUpdater.exe",
-          "size": 8126482,
-          "sha256": "7e7eaddded9c6663118afec512e18ea608f3f7063db8fd6d66148b5550eb71a0"
+          "size": 8126615,
+          "sha256": "3c540d690e5eaa166032bac8084459ca4c2b4c47c067311cfc623e5022ac0661"
         },
         {
           "path": "_internal/MarkupSafe-3.0.2.dist-info/INSTALLER",
@@ -547,7 +547,7 @@
         {
           "path": "_internal/base_library.zip",
           "size": 1333418,
-          "sha256": "a987cb412f8d90b397e6b3604ea4a12c4e40eb4a7be7083849aaa295771980fc"
+          "sha256": "ef51511c158130ce282377eb924cca2acc36284cbbc93b01d23ad3d84a692190"
         },
         {
           "path": "_internal/basic_pitch-0.4.0.dist-info/INSTALLER",
@@ -793,6 +793,11 @@
           "path": "_internal/charset_normalizer/md__mypyc.cp312-win_amd64.pyd",
           "size": 125440,
           "sha256": "ffe8d64a38b4060055beb2076e669b61034c045e3ec53bac74ee66bba3fc26c0"
+        },
+        {
+          "path": "_internal/concrt140.dll",
+          "size": 315704,
+          "sha256": "6f0eb78841b49768e40a11c502029dc4236dc3a335d50f8d87860455d4304e9a"
         },
         {
           "path": "_internal/cryptography-48.0.0.dist-info/INSTALLER",
@@ -1723,6 +1728,21 @@
           "path": "_internal/msvcp140.dll",
           "size": 549176,
           "sha256": "708dd7bbc7bd23bce9e93f7837a70c2dd7ad55cff43801e92c0f7fcd7dda47cd"
+        },
+        {
+          "path": "_internal/msvcp140_1.dll",
+          "size": 27448,
+          "sha256": "b2113956aa3fcb9decfe65be1ee7829f8e3ae0899633ae89fe04888ada201594"
+        },
+        {
+          "path": "_internal/msvcp140_2.dll",
+          "size": 271672,
+          "sha256": "1b806b427ffb573deff8478cf6fe336465fe2c67e0919bb95f452b6f31d25736"
+        },
+        {
+          "path": "_internal/msvcp140_codecvt_ids.dll",
+          "size": 23352,
+          "sha256": "b2fcf12b26f6e7080272fad62cecaa4226392622d674af55f38c22ba4405a2ea"
         },
         {
           "path": "_internal/numba-0.67.0.dist-info/INSTALLER",
@@ -7500,6 +7520,11 @@
           "sha256": "b77a639be84b4ffc68fa7810e3f7bbf441b87644e02caa8f44ba5a61ec096ab4"
         },
         {
+          "path": "_internal/pay.jpg",
+          "size": 82454,
+          "sha256": "2389ff08413d80eb29fc50930663b3fa52561a144f37986d909b302bbc1865ad"
+        },
+        {
           "path": "_internal/pooch-1.9.0.dist-info/INSTALLER",
           "size": 4,
           "sha256": "ceebae7b8927a3227e5303cf5e0f1f7b34bb542ad7250ac03fbcde36ec2f1508"
@@ -10595,6 +10620,11 @@
           "sha256": "e7fe7ae7342b1dec8dfe52a95d768039a46189209b9f42a21c4d2473faaa1753"
         },
         {
+          "path": "_internal/vcomp140.dll",
+          "size": 155448,
+          "sha256": "180274d56b0f607e04b3963dd795dfdb17551af1e27446fa1cbe0b0551df42f5"
+        },
+        {
           "path": "_internal/vcruntime140.dll",
           "size": 116024,
           "sha256": "c6e841078cd352299a58925991e2552f7251b046253ba895b3ad50cd5cd32ec6"
@@ -10622,28 +10652,84 @@
       ],
       "patches": [
         {
-          "from": "1.0.2",
-          "to": "1.0.3",
-          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.3/AutoPlay-patch-full-1.0.2-to-1.0.3.zip",
-          "size": 22456845,
-          "sha256": "d1d36980d2d6844ed302e59f15bca7bddd9a48e68e04e007fc3752eb5cdc170e",
+          "from": "1.0.3",
+          "to": "1.0.7",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.7/AutoPlay-patch-full-1.0.3-to-1.0.7.zip",
+          "size": 30865002,
+          "sha256": "cbb920516182a6986e98ef264713865ae5dfb29b8ee7dce8f3cdd9f42aebeb2c",
+          "removed": []
+        },
+        {
+          "from": "1.0.3",
+          "to": "1.0.6",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.6/AutoPlay-patch-full-1.0.3-to-1.0.6.zip",
+          "size": 30864556,
+          "sha256": "4e5f3eb5a8d4acb353bd24871c33a726ada936befc8a90b9713d0c94d245cc76",
+          "removed": []
+        },
+        {
+          "from": "1.0.4",
+          "to": "1.0.7",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.7/AutoPlay-patch-full-1.0.4-to-1.0.7.zip",
+          "size": 30865002,
+          "sha256": "a422afb7bd34c06f2baef1fe597f4548ce8c613197c79399edc5d00e4f7cf320",
+          "removed": []
+        },
+        {
+          "from": "1.0.4",
+          "to": "1.0.6",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.6/AutoPlay-patch-full-1.0.4-to-1.0.6.zip",
+          "size": 30864556,
+          "sha256": "5ced1f4a0ca66b516035b588152eaf0086eb8db6f4c4c843495e5937a24c7887",
+          "removed": []
+        },
+        {
+          "from": "1.0.4",
+          "to": "1.0.5",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.5/AutoPlay-patch-full-1.0.4-to-1.0.5.zip",
+          "size": 22463530,
+          "sha256": "be804ef7c2c4122a487a6e1e6fd9308f52e7bb6346d7d224d872cec46bd80c04",
+          "removed": []
+        },
+        {
+          "from": "1.0.5",
+          "to": "1.0.7",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.7/AutoPlay-patch-full-1.0.5-to-1.0.7.zip",
+          "size": 30865002,
+          "sha256": "26cd4ca52970145685605938eb57fb7103c1c452fc1325c261a223c08ae2042b",
+          "removed": []
+        },
+        {
+          "from": "1.0.5",
+          "to": "1.0.6",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.6/AutoPlay-patch-full-1.0.5-to-1.0.6.zip",
+          "size": 30864557,
+          "sha256": "56094faab3c5ebb442e5b5e5e010c4d942f7ff11326234a2d76d2d677bcdd4b4",
+          "removed": []
+        },
+        {
+          "from": "1.0.6",
+          "to": "1.0.7",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.7/AutoPlay-patch-full-1.0.6-to-1.0.7.zip",
+          "size": 22494842,
+          "sha256": "dca21893b6ce01c89a7158b89b759993c6cc153720328da04227b5edbdef242e",
           "removed": []
         }
       ]
     },
     "lite": {
       "label": "精简版",
-      "version": "1.0.3",
+      "version": "1.0.7",
       "package": {
-        "url": "https://github.com/xXjuanneysXx/Auto-Midi-Player/releases/download/v1.0.3/AutoPlay%20%E7%B2%BE%E7%AE%80%E7%89%88%20%E5%AE%89%E8%A3%85%E7%A8%8B%E5%BA%8F%20v1.0.3.exe",
-        "size": 108036107,
-        "sha256": "da9edfabe80492f1665236a15a25008f6759e1cbe89ff9dd432db3aa4ce2b917"
+        "url": "https://github.com/xXjuanneysXx/Auto-Midi-Player/releases/download/v1.0.7/AutoPlay%20%E7%B2%BE%E7%AE%80%E7%89%88%20%E5%AE%89%E8%A3%85%E7%A8%8B%E5%BA%8F%20v1.0.7.exe",
+        "size": 108666785,
+        "sha256": "cf210d0a01638a1d403b4e3fb25d85b0579a135816e75cbca5b2fe9c058c33e8"
       },
       "files": [
         {
           "path": "AutoPlay.exe",
-          "size": 6505318,
-          "sha256": "31826593f6e9eb88f4f249e6ea7b9f0daaf0fd6a8ab0678c69ff1427585c224d"
+          "size": 6543157,
+          "sha256": "d138567860c4bb4b787301daf150bc107f0a5f0accacf0a9141794f26f33db54"
         },
         {
           "path": "AutoPlay.ico",
@@ -10652,8 +10738,8 @@
         },
         {
           "path": "AutoPlayUpdater.exe",
-          "size": 8126482,
-          "sha256": "7e7eaddded9c6663118afec512e18ea608f3f7063db8fd6d66148b5550eb71a0"
+          "size": 8126615,
+          "sha256": "3c540d690e5eaa166032bac8084459ca4c2b4c47c067311cfc623e5022ac0661"
         },
         {
           "path": "_internal/PyDirectInput-1.0.4.dist-info/INSTALLER",
@@ -10864,16 +10950,6 @@
           "path": "_internal/PySide6/pyside6.abi3.dll",
           "size": 248632,
           "sha256": "d4072be872b31f3748de5e6c28cb2976dafbf063d3ccfa38e5dabda29babcdaf"
-        },
-        {
-          "path": "_internal/VCRUNTIME140.dll",
-          "size": 120400,
-          "sha256": "36585912e5eaf83ba9fea0631534f690ccdc2d7ba91537166fe53e56c221e153"
-        },
-        {
-          "path": "_internal/VCRUNTIME140_1.dll",
-          "size": 49744,
-          "sha256": "82a2f9ae1e6146ae3cb0f4bc5a62b7227e0384209d9b1aef86bbcc105912f7cd"
         },
         {
           "path": "_internal/_asyncio.pyd",
@@ -11138,7 +11214,7 @@
         {
           "path": "_internal/base_library.zip",
           "size": 1333418,
-          "sha256": "46f000560b27e84cc6eb1dd321b854816b73e0106765039989ecec127d85bd5d"
+          "sha256": "fbc75bebca2f09084477a0cd3efa8895134a34cfe13f339524d130f4f4671162"
         },
         {
           "path": "_internal/charset_normalizer/md.cp312-win_amd64.pyd",
@@ -11149,6 +11225,11 @@
           "path": "_internal/charset_normalizer/md__mypyc.cp312-win_amd64.pyd",
           "size": 125440,
           "sha256": "ffe8d64a38b4060055beb2076e669b61034c045e3ec53bac74ee66bba3fc26c0"
+        },
+        {
+          "path": "_internal/concrt140.dll",
+          "size": 315704,
+          "sha256": "6f0eb78841b49768e40a11c502029dc4236dc3a335d50f8d87860455d4304e9a"
         },
         {
           "path": "_internal/keyboard-0.13.5.dist-info/INSTALLER",
@@ -11331,6 +11412,26 @@
           "sha256": "5af225a70773f6e9a069eb7a1595d52b742b0524b20dfcfab78fbfd37a37c336"
         },
         {
+          "path": "_internal/msvcp140.dll",
+          "size": 549176,
+          "sha256": "708dd7bbc7bd23bce9e93f7837a70c2dd7ad55cff43801e92c0f7fcd7dda47cd"
+        },
+        {
+          "path": "_internal/msvcp140_1.dll",
+          "size": 27448,
+          "sha256": "b2113956aa3fcb9decfe65be1ee7829f8e3ae0899633ae89fe04888ada201594"
+        },
+        {
+          "path": "_internal/msvcp140_2.dll",
+          "size": 271672,
+          "sha256": "1b806b427ffb573deff8478cf6fe336465fe2c67e0919bb95f452b6f31d25736"
+        },
+        {
+          "path": "_internal/msvcp140_codecvt_ids.dll",
+          "size": 23352,
+          "sha256": "b2fcf12b26f6e7080272fad62cecaa4226392622d674af55f38c22ba4405a2ea"
+        },
+        {
           "path": "_internal/numpy.libs/libscipy_openblas64_-43e11ff0749b8cbe0a615c9cf6737e0e.dll",
           "size": 20301824,
           "sha256": "634687ca5fedef76e784d8c54fc4ba2f965a44c0b60d754c49174589deab8157"
@@ -11404,6 +11505,11 @@
           "path": "_internal/numpy/random/mtrand.cp312-win_amd64.pyd",
           "size": 635904,
           "sha256": "e426fe122c7b770c2fbda7add6c9ee9189040a996ad2f839d72e2d62e4acb141"
+        },
+        {
+          "path": "_internal/pay.jpg",
+          "size": 82454,
+          "sha256": "2389ff08413d80eb29fc50930663b3fa52561a144f37986d909b302bbc1865ad"
         },
         {
           "path": "_internal/psutil/_psutil_windows.pyd",
@@ -11556,6 +11662,21 @@
           "sha256": "e7fe7ae7342b1dec8dfe52a95d768039a46189209b9f42a21c4d2473faaa1753"
         },
         {
+          "path": "_internal/vcomp140.dll",
+          "size": 155448,
+          "sha256": "180274d56b0f607e04b3963dd795dfdb17551af1e27446fa1cbe0b0551df42f5"
+        },
+        {
+          "path": "_internal/vcruntime140.dll",
+          "size": 116024,
+          "sha256": "c6e841078cd352299a58925991e2552f7251b046253ba895b3ad50cd5cd32ec6"
+        },
+        {
+          "path": "_internal/vcruntime140_1.dll",
+          "size": 41272,
+          "sha256": "b322e382ea249b50009f14a9a71ad16729eb6e4b58a8d3b3be6ac66ea6342a22"
+        },
+        {
           "path": "_internal/winsound.pyd",
           "size": 32624,
           "sha256": "5bca86870468ecac2da9234c7157007e59bf5697b1ab86c5d0f4d85ffc2f0ab8"
@@ -11573,11 +11694,67 @@
       ],
       "patches": [
         {
-          "from": "1.0.2",
-          "to": "1.0.3",
-          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.3/AutoPlay-patch-lite-1.0.2-to-1.0.3.zip",
-          "size": 6763678,
-          "sha256": "65caa7d10c8604d14f140cea3974ff950d909c01cd93fd94176a5d2e67e76dc8",
+          "from": "1.0.3",
+          "to": "1.0.7",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.7/AutoPlay-patch-lite-1.0.3-to-1.0.7.zip",
+          "size": 15433672,
+          "sha256": "9f0cfbe89a81a71c7d1fbac780ac2254220f80a03282f6e31b7ffb9da8f0c419",
+          "removed": []
+        },
+        {
+          "from": "1.0.3",
+          "to": "1.0.6",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.6/AutoPlay-patch-lite-1.0.3-to-1.0.6.zip",
+          "size": 15432585,
+          "sha256": "c55419b4102808f026f92a49823de25e34fe0cdce98cf64449ea7f8eaa5da72a",
+          "removed": []
+        },
+        {
+          "from": "1.0.4",
+          "to": "1.0.7",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.7/AutoPlay-patch-lite-1.0.4-to-1.0.7.zip",
+          "size": 15433672,
+          "sha256": "575e2983ae8df89ce1127aed37f5f8a60db64a717e84ac6fb4a7f5989238f9e8",
+          "removed": []
+        },
+        {
+          "from": "1.0.4",
+          "to": "1.0.6",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.6/AutoPlay-patch-lite-1.0.4-to-1.0.6.zip",
+          "size": 15432585,
+          "sha256": "758b3bced2920bdd1af8b9b836085d4bcd37aba819d7cf677a532e8fa752f22d",
+          "removed": []
+        },
+        {
+          "from": "1.0.4",
+          "to": "1.0.5",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.5/AutoPlay-patch-lite-1.0.4-to-1.0.5.zip",
+          "size": 6770948,
+          "sha256": "30cbdd07462eb3d0d8aeacd4d1667c09e1465b047c0864b0688712468791e3f9",
+          "removed": []
+        },
+        {
+          "from": "1.0.5",
+          "to": "1.0.7",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.7/AutoPlay-patch-lite-1.0.5-to-1.0.7.zip",
+          "size": 15433672,
+          "sha256": "a6d676ec079196a3814330c4f91a7b847e53bfaed81f35840b810a886d8aa108",
+          "removed": []
+        },
+        {
+          "from": "1.0.5",
+          "to": "1.0.6",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.6/AutoPlay-patch-lite-1.0.5-to-1.0.6.zip",
+          "size": 15432585,
+          "sha256": "a4b36cfa9fb68a6c529e3bf45f4afe7fb92b1469992a4217c922d56623f200c3",
+          "removed": []
+        },
+        {
+          "from": "1.0.6",
+          "to": "1.0.7",
+          "url": "https://gitee.com/juanneys/midi-music/releases/download/v1.0.7/AutoPlay-patch-lite-1.0.6-to-1.0.7.zip",
+          "size": 6801036,
+          "sha256": "3099051cc8150a332b50337e56ed5fde9281828ec27b8344d72160f02c7da10e",
           "removed": []
         }
       ]

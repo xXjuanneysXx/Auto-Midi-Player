@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from collections import deque
 
 import edition
 import library
@@ -100,12 +101,79 @@ def local_differs(install_dir, files):
     return out
 
 
-def patch_for(data, current, key=None):
-    """有没有「从 current 这一版直接升上去」的差分包。"""
+def patch_list(data, key=None):
+    """清单里挂着的所有差分包（按 (from, to) 去重，保持清单里的顺序）。"""
+    out = []
+    seen = set()
     for item in (edition_entry(data, key).get('patches') or []):
-        if isinstance(item, dict) and str(item.get('from') or '') == str(current):
-            return item
-    return None
+        if not isinstance(item, dict):
+            continue
+        src = str(item.get('from') or '').strip()
+        dst = str(item.get('to') or '').strip()
+        if not (src and dst and str(item.get('url') or '').strip()):
+            continue
+        tag = (src, dst)
+        if tag in seen:
+            continue
+        seen.add(tag)
+        item = dict(item)
+        item['from'], item['to'] = src, dst
+        out.append(item)
+    return out
+
+
+def patch_for(data, current, key=None):
+    """有没有「从 current 这一版直接升上去」的差分包。
+
+    同一个 `from` 挂了好几条时（比如 1.0.4→1.0.5 和 1.0.4→1.0.6 都在），
+    挑 **`to` 最新的那条** —— 免得先升到中间版本，还得再点一次更新。
+    """
+    best = None
+    for item in patch_list(data, key):
+        if item['from'] != str(current):
+            continue
+        if best is None or notice.compare_versions(item['to'], best['to']) > 0:
+            best = item
+    return best
+
+
+def patch_chain(data, current, latest, key=None):
+    """
+    从 current 到 latest 的一条差分包链（挑跳数最少的）；接不上返回 []。
+
+    什么时候用得上：清单里只挂着「一跳一跳」的差分包（1.0.3→1.0.4、
+    1.0.4→1.0.5…），手上这版又没有直达最新版的包。以前这种情况只能去下完整
+    安装包，现在顺着这些一跳的包也能接过去：客户端把整条链上的包依次下好，
+    交给更新器按顺序覆盖。
+    """
+    current = str(current or '').strip()
+    latest = str(latest or '').strip()
+    edges = []
+    for item in patch_list(data, key):
+        src, dst = item['from'], item['to']
+        if notice.compare_versions(dst, src) <= 0:
+            continue                  # 不是往更新的方向走的包，别用
+        if notice.compare_versions(dst, latest) > 0:
+            continue                  # 越过最新版了，别用
+        edges.append(item)
+    if not edges:
+        return []
+    by_from = {}
+    for item in edges:
+        by_from.setdefault(item['from'], []).append(item)
+    queue = deque([(current, [])])
+    seen = {current}
+    while queue:
+        node, path = queue.popleft()
+        if node == latest:
+            return path
+        for item in by_from.get(node, []):
+            nxt = item['to']
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            queue.append((nxt, path + [item]))
+    return []
 
 
 def plan(current, install_dir, data=None):
@@ -113,8 +181,10 @@ def plan(current, install_dir, data=None):
     我该走哪条路。返回的 dict 里 mode 是：
 
         none   已经是最新（或者文件本来就一样，不用换）
-        patch  有差分包，可以增量更新
-        full   没有差分包，只能下完整安装包
+        patch  有差分包，可以增量更新（patches 是这一趟要依次盖上去的包，
+               通常只有一个；手上这版没有直达最新版的包、但清单里挂着一跳一跳
+               的包时，会顺着拼成一条链，patches 就有好几个）
+        full   接不上任何差分包，只能下完整安装包
         error  拉不到清单 / 清单不完整（why 里是原因）
 
     data 已经由调用方拉好了就直接传进来（省一次网络请求，也免得前后两次拿到
@@ -137,9 +207,10 @@ def plan(current, install_dir, data=None):
     if not local_differs(install_dir, files):
         return {'mode': 'none', 'latest': latest, 'data': data, 'files': files,
                 'why': '程序文件已经跟最新版一模一样'}
-    patch = patch_for(data, current)
-    if patch and patch.get('url'):
-        return {'mode': 'patch', 'latest': latest, 'patch': patch, 'data': data,
+    chain = patch_chain(data, current, latest)
+    if chain:
+        return {'mode': 'patch', 'latest': latest, 'patches': chain,
+                'patch': chain[0] if len(chain) == 1 else {}, 'data': data,
                 'files': files}
     return {'mode': 'full', 'latest': latest, 'data': data, 'files': files,
             'package': entry.get('package') or {}}
@@ -228,13 +299,22 @@ def extract(zip_path, dest_dir):
 
 # ---------- 启动更新器 ----------
 
-def launch_updater(zip_path, install_dir, version, pid=None, relaunch=True, timeout=180):
+def launch_updater(zip_paths, install_dir, version, pid=None, relaunch=True, timeout=180):
     """
     启动 AutoPlayUpdater.exe：它先等主程序退出，再解压覆盖、失败回滚、重启。
 
     注意更新器是**复制到临时目录再跑**的 —— 它待会儿要覆盖安装目录里的自己，
     正跑着的 exe 锁着自己，不先搬走就换不了。
+
+    `zip_paths` 可以是一个路径，也可以是按顺序排好的好几个（多跳增量：先盖第一
+    个包、再盖第二个…）。老版本的更新器只认一个 `--patch`，所以只有客户端和
+    更新器都够新的时候才会走到多包那条路。
     """
+    if isinstance(zip_paths, (str, bytes, os.PathLike)):
+        zip_paths = [zip_paths]
+    zip_paths = [str(path) for path in zip_paths if path]
+    if not zip_paths:
+        return '', '没有要装的差分包。'
     source = os.path.join(install_dir, UPDATER_EXE)
     if not os.path.isfile(source):
         return '', ('安装目录里没有 %s —— 老版本没有带更新器，请下载完整安装包。'
@@ -246,8 +326,10 @@ def launch_updater(zip_path, install_dir, version, pid=None, relaunch=True, time
         shutil.copy2(source, runner)
     except Exception as error:
         return '', '更新器搬不出来：%s' % error
-    args = [runner, '--patch', zip_path, '--target', install_dir, '--version', str(version),
+    args = [runner, '--target', install_dir, '--version', str(version),
             '--exe', APP_EXE, '--pid', str(int(pid or 0)), '--timeout', str(int(timeout))]
+    for path in zip_paths:
+        args += ['--patch', path]
     if relaunch:
         args.append('--relaunch')
     try:

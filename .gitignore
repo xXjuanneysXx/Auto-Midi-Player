@@ -47,6 +47,9 @@ build_lite/
 # 内置的 GitHub 令牌（只在这台机器 / 自己打的包里，绝不进 git）
 github_token_local.py
 
+# 发版脚本专用的 GitHub 令牌（只给「上传源码到GitHub.py」用，授权的是源码仓库）
+github_token_src_local.py
+
 # 内置的 Gitee 令牌（同上，绝不进 git）
 gitee_token_local.py
 

@@ -90,6 +90,31 @@ if LITE:
 # 那份会优先被找到（见 main.py 的 app_subdir），这份是「只拷 dist 目录也能用」的兜底。
 datas += [('songs', 'songs')]
 
+# 「打赏作者」那张收款码：打进 exe，离线也能看（源码运行就直接读仓库里的）
+if os.path.exists('pay.jpg'):
+    datas.append(('pay.jpg', '.'))
+
+# VC++ 运行库：PySide6 / shiboken6 / onnxruntime 都要 msvcp140*.dll / vcruntime140*.dll。
+# PyInstaller 把它们塞在 PySide6\ / shiboken6\ 子目录里，_internal 根目录经常缺
+# msvcp140_1.dll / msvcp140_2.dll —— 干净系统上就报 “DLL load failed”。这里从
+# PySide6 / shiboken6 目录里把整套显式收集到 _internal 根，用户不用再装 VC redist。
+VC_DLL_PATTERNS = ('msvcp140*.dll', 'vcruntime140*.dll', 'concrt140.dll', 'vcomp140.dll')
+_vc_roots = []
+for _module in ('PySide6', 'shiboken6'):
+    try:
+        _vc_roots.append(os.path.dirname(__import__(_module).__file__))
+    except Exception:
+        pass
+_vc_seen = set()
+for _root in _vc_roots:
+    for _pattern in VC_DLL_PATTERNS:
+        for _path in glob.glob(os.path.join(_root, _pattern)):
+            _name = os.path.basename(_path).lower()
+            if _name in _vc_seen:
+                continue
+            _vc_seen.add(_name)
+            binaries.append((_path, '.'))
+
 # 图标：make_installer.py 生成，没有就先不打（不影响功能）
 ICON = 'AutoPlay.ico' if os.path.exists('AutoPlay.ico') else None
 

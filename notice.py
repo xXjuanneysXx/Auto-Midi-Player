@@ -68,10 +68,38 @@ def _raw_url(site, owner, repo, branch, name):
     return 'https://gitee.com/%s/%s/raw/%s/%s' % (owner, repo, branch, name)
 
 
+def _no_cache(url):
+    """
+    给地址加一个每次都变的查询参数，躲开 CDN 缓存。
+
+    这几个 json 走的是 raw 直链 / contents 接口，两边都是 CDN，缓存 key 就是整个 URL。
+    文件被覆盖之后，裸链接可能还会吐旧内容 —— 实测抓到过 40 分钟前的版本信息，
+    更新时就成了「清单里写的大小跟下下来的包对不上」。加个时间戳，每次都是新 URL，
+    CDN 只能回源（Gitee 读接口的 access_token 是后面拼上去的，不受影响）。
+    """
+    if not url:
+        return url
+    sep = '&' if '?' in url else '?'
+    return '%s%s_=%d' % (url, sep, time.time())
+
+
 def _from_api(site, owner, repo, branch, name, timeout):
-    """contents 接口：拿回来的是 base64 的 content。"""
-    url = library._contents_url(site, owner, repo, name, branch)
-    data, code, why = library._api_raw(url, '', timeout=timeout, site=site)
+    """contents 接口：拿回来的是 base64 的 content。
+
+    Gitee 这个接口**匿名调会 403**（本程序实测），于是就走不成「国内曲库」，
+    只能退到 GitHub raw —— 而 raw 在国内常连不上、还有几分钟的 CDN 缓存，
+    新公告 / 新版本就会迟迟刷不出来。所以这里带上程序里内置的那个令牌
+    （跟曲库读写用的是同一个，见 library.get_token）；令牌不行再退回匿名试一次。
+    """
+    url = _no_cache(library._contents_url(site, owner, repo, name, branch))
+    token = ''
+    try:
+        token = str(library.get_token(site) or '')
+    except Exception:
+        token = ''
+    data, code, why = library._api_raw(url, token, timeout=timeout, site=site)
+    if token and not (isinstance(data, dict) and data.get('content')):
+        data, code, why = library._api_raw(url, '', timeout=timeout, site=site)
     if isinstance(data, dict) and data.get('content'):
         try:
             text = base64.b64decode(data['content']).decode('utf-8', 'replace')
@@ -86,19 +114,30 @@ def _from_api(site, owner, repo, branch, name, timeout):
 def _fetch_once(site, owner, repo, branch, name, timeout):
     """从某一套曲库里拉一个文件，返回 (文本, 出错信息)。"""
     why = ''
+    raw = _no_cache(_raw_url(site, owner, repo, branch, name))
     if site == library.SITE_GITHUB:
-        # GitHub 先走 raw（快、不限流），拉不到再走 API
+        # GitHub 先走 raw（快、不限流）。这里**故意不带 jsDelivr 镜像**：
+        # 它对分支地址是 12 小时长缓存，查询串又不进缓存键（_no_cache 的时间戳
+        # 对它无效），版本信息从它那儿拿就是旧的 —— 界面会一直说「已是最新」。
         try:
-            text, why = library._try_all(_raw_url(site, owner, repo, branch, name),
-                                         timeout, name, total=timeout)
+            text, why = library._try_all(raw, timeout, name, total=timeout, mirror=False)
             if text:
                 return text, ''
         except Exception as error:
             why = str(error)
-    # Gitee 的 raw 会被审核挡掉，直接走 contents API（拿 base64 再解）
+    # Gitee 的 raw 会被审核挡掉，直接走 contents API（拿 base64 再解）；
+    # GitHub 这边 raw 连不上时也走它 —— 带内置令牌，内容是实时的
     text, why_api = _from_api(site, owner, repo, branch, name, timeout)
     if text:
         return text, ''
+    # 两条路都不通才轮到 jsDelivr 镜像兜底（可能旧，但总比什么都没有强）
+    for mirror in library.mirror_urls(raw):
+        try:
+            text, why_mirror = library._try_all(mirror, timeout, name, total=timeout)
+        except Exception as error:
+            why_mirror = str(error)
+        if text:
+            return text, ''
     return '', why_api or why
 
 

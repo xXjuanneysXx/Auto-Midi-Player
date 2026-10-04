@@ -17,6 +17,8 @@ AutoPlay：选 midi -> 生成简谱 -> 在游戏里自动演奏
 import ctypes
 import faulthandler
 import os
+import re
+import shutil
 import sys
 import theme
 import threading
@@ -38,6 +40,7 @@ try:                                                  # 优先 Qt 官方绑定
                                    QListWidget, QListWidgetItem, QMenu, QProgressBar,
                                    QPushButton, QSlider,
                                    QScrollArea, QSizePolicy, QSpinBox, QSystemTrayIcon,
+                                   QStyle, QStyledItemDelegate, QStyleOptionViewItem,
                                    QTabWidget, QTextEdit, QVBoxLayout, QWidget)
 except ImportError:                                   # 装了 PyQt6 也行
     from PyQt6.QtCore import (QEvent, QPoint, QRectF, QSettings, QSize, Qt, QTimer, QUrl,
@@ -49,11 +52,13 @@ except ImportError:                                   # 装了 PyQt6 也行
                                  QListWidget, QListWidgetItem, QMenu, QProgressBar,
                                  QPushButton, QSlider,
                                  QScrollArea, QSizePolicy, QSpinBox, QSystemTrayIcon,
+                                 QStyle, QStyledItemDelegate, QStyleOptionViewItem,
                                  QTabWidget, QTextEdit, QVBoxLayout, QWidget)
 
 import audiowatch
 import autosave
 import edition
+import errorreport
 import fileassoc
 import notice as notice_mod
 import uiicons
@@ -87,7 +92,7 @@ if not edition.has_recorder():
                                     if a != 'record')
 
 APP_TITLE = 'MIDI 简谱自动演奏' + ('（精简版）' if edition.LITE else '')
-APP_VERSION = '1.0.3'
+APP_VERSION = '1.0.7'
 MIDI_FILTER = 'MIDI 文件 (*.mid *.midi *.kar *.rmi);;所有文件 (*.*)'
 # 覆盖模式下不用系统文件框，自己列目录，靠这个认出 MIDI 文件
 MIDI_SUFFIX = ('.mid', '.midi', '.kar', '.rmi')
@@ -395,6 +400,17 @@ def app_subdir(*names):
     return os.path.join(app_dir(), names[0])
 
 
+def asset_path(name):
+    """找一个打包进来的资源文件（pay.jpg 这种）：安装目录 / _internal / 源码目录。"""
+    roots = [app_dir(), os.path.join(app_dir(), '_internal'),
+             os.path.dirname(os.path.abspath(__file__))]
+    for root in roots:
+        path = os.path.join(root, name)
+        if os.path.isfile(path):
+            return path
+    return ''
+
+
 # 内置曲库：安装目录下的 songs\（安装程序装出来就是这个结构）。
 # 源码运行时直接用仓库里的 songs\。
 SONG_DIR = app_subdir('songs', '曲库')
@@ -448,8 +464,23 @@ def log_event(text):
 
 
 def log_crash(text):
-    """出错时把完整的 traceback 记进同一个日志。"""
+    """出错时把完整的 traceback 记进同一个日志，顺手往曲库仓库上报一份（可关）。"""
     log_event('出错了：\n%s' % text)
+    try:
+        errorreport.send(text, where='程序')
+    except Exception:
+        pass
+
+
+def _thread_excepthook(args):
+    """后台线程没接住的异常：跟前台一样记日志 + 上报。"""
+    try:
+        log_crash('线程 %s 出错：\n%s'
+                  % (getattr(args.thread, 'name', '?'),
+                     ''.join(traceback.format_exception(args.exc_type, args.exc_value,
+                                                        args.exc_traceback))))
+    except Exception:
+        pass
 
 
 def is_admin():
@@ -562,6 +593,66 @@ def set_no_activate(widget, on=True):
         user32.SetWindowLongW(hwnd, gwl_exstyle,
                               style | ws_ex_noactivate if on
                               else style & ~ws_ex_noactivate)
+        return True
+    except Exception:
+        return False
+
+
+def allow_lower_privilege_drop(widget):
+    """
+    尽量让「以管理员身份运行」时也能接收从资源管理器拖过来的文件。
+
+    Windows 的完整性级别（UIPI）默认禁止把东西从普通权限的资源管理器拖进提了权的
+    窗口：光标会变成一个禁止的圆圈，而且**事件根本不会送进程序**（所以程序里没法
+    自己检测、也没法提示）。官方给的办法是给窗口放过这几条消息
+    （WM_DROPFILES / WM_COPYDATA / WM_COPYGLOBALDATA）。
+
+    实话说：能不能成取决于系统怎么发起这次拖拽 —— 走 OLE 那条路时 Windows 就是
+    不放行，程序只能改用「选择文件」按钮 / 复制进曲库文件夹。真正想稳，就得让程序
+    以**普通权限**启动（见 README「拖拽导入」一节）。
+    """
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = ctypes.c_void_p(int(widget.winId()))
+        if not hwnd:
+            return False
+        for message in (0x0233, 0x004A, 0x0049):   # WM_DROPFILES / COPYDATA / COPYGLOBALDATA
+            try:
+                user32.ChangeWindowMessageFilterEx(hwnd, ctypes.c_uint(message),
+                                                   ctypes.c_uint(1), None)   # MSGFLT_ALLOW
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def set_taskbar_window(widget, on=True):
+    """
+    把窗口临时变成「任务栏认得的那种普通窗口」（on=True），或者换回浮层（on=False）。
+
+    最小化之前为什么非要这一步：浮层配方给窗口挂了 WS_EX_NOACTIVATE（点它不抢游戏
+    焦点）。微软文档写得很明白 —— 带这个位的窗口**默认不进任务栏**。没有任务栏按钮，
+    最小化动画就没有落点，Windows 会把窗口最后那幅画面丢在桌面上（实测：屏幕左边会
+    留一条标题栏残影，点别的窗口都不一定擦得掉），任务栏里也找不到它 —— 用户点了
+    最小化会觉得「程序没了」。
+
+    所以最小化之前摘掉 NOACTIVATE、补上 APPWINDOW；还原的时候再换回去（浮层还是
+    别在任务栏里占位）。两个位一次 SetWindowLongW 改完，中间不会闪一下。
+    """
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = ctypes.c_void_p(int(widget.winId()))
+        if not hwnd:
+            return False
+        gwl_exstyle, ws_ex_noactivate, ws_ex_appwindow = -20, 0x08000000, 0x00040000
+        user32.GetWindowLongW.restype = ctypes.c_long
+        style = user32.GetWindowLongW(hwnd, gwl_exstyle)
+        if on:
+            style = (style | ws_ex_appwindow) & ~ws_ex_noactivate
+        else:
+            style = (style | ws_ex_noactivate) & ~ws_ex_appwindow
+        user32.SetWindowLongW(hwnd, gwl_exstyle, style)
         return True
     except Exception:
         return False
@@ -1423,6 +1514,179 @@ class InfoWindow(QWidget):
         super().closeEvent(event)
 
 
+class RewardWindow(QWidget):
+    """
+    「打赏作者」小窗口：一句话 + 收款码图片。
+
+    跟 InfoWindow 一个规矩 —— 普通顶层窗口（能最小化、能关、不置顶），不往主界面里
+    塞面板。图片 pay.jpg 打包进 exe，离线也能看。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('root')
+        self.setWindowTitle('%s — 打赏作者' % APP_TITLE)
+        self.setWindowFlags(Qt.WindowType.Window
+                            | Qt.WindowType.WindowSystemMenuHint
+                            | Qt.WindowType.WindowMinimizeButtonHint
+                            | Qt.WindowType.WindowCloseButtonHint)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 14, 14, 14)
+        outer.setSpacing(0)
+        card = QFrame()
+        card.setObjectName('neuPanel')
+        outer.addWidget(card)
+        box = QVBoxLayout(card)
+        box.setContentsMargins(16, 14, 16, 14)
+        box.setSpacing(10)
+
+        caption = QLabel('未成年人请不要打赏')
+        caption.setObjectName('panelTitle')
+        caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        box.addWidget(caption)
+
+        self.picture = QLabel()
+        self.picture.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loaded = False
+        path = asset_path('pay.jpg')
+        if path:
+            pixmap = QPixmap(path)
+            if not pixmap.isNull():
+                shown = pixmap.scaled(320, 420, Qt.AspectRatioMode.KeepAspectRatio,
+                                      Qt.TransformationMode.SmoothTransformation)
+                self.picture.setPixmap(shown)
+                self.picture.setFixedSize(shown.size())
+                loaded = True
+        if not loaded:
+            self.picture.setText('（没找到收款码图片 pay.jpg）')
+        box.addWidget(self.picture, 0, Qt.AlignmentFlag.AlignCenter)
+
+        tip = QLabel('感谢支持，请量力而行')
+        tip.setObjectName('panelMeta')
+        tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        box.addWidget(tip)
+
+        foot = QHBoxLayout()
+        foot.addStretch(1)
+        close = QPushButton('关闭')
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.clicked.connect(self.close)
+        foot.addWidget(close)
+        box.addLayout(foot)
+
+
+class SearchDelegate(QStyledItemDelegate):
+    """
+    曲库列表的搜索高亮。
+
+    命中关键字的**那一段**换个底色 + 深色字（选中 / 悬停那套底色照旧由 Qt 画，
+    只把文字抠出来自己重画）。关键字默认按「包含」匹配，勾上「正则」就按正则来。
+    """
+
+    HIGHLIGHT = QColor('#ffd166')          # 命中段的底色
+    HIGHLIGHT_TEXT = QColor('#4a2f00')     # 命中段的字色
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.term = ''
+        self.use_regex = False
+        self._cache = {}
+
+    def set_term(self, term, use_regex=False):
+        self.term = str(term or '')
+        self.use_regex = bool(use_regex)
+        self._cache = {}
+
+    def matches(self, text):
+        """这段文字里命中的区间 [(起, 止), ...]；没命中就是空表。"""
+        text = str(text or '')
+        if not self.term:
+            return []
+        if text in self._cache:
+            return self._cache[text]
+        out = []
+        try:
+            if self.use_regex:
+                for match in re.finditer(self.term, text, re.IGNORECASE):
+                    if match.end() > match.start():
+                        out.append((match.start(), match.end()))
+                    if len(out) >= 100:
+                        break
+            else:
+                low = text.lower()
+                term = self.term.lower()
+                start = 0
+                while len(out) < 100:
+                    at = low.find(term, start)
+                    if at < 0:
+                        break
+                    out.append((at, at + len(term)))
+                    start = at + max(1, len(term))
+        except re.error:
+            out = []                       # 正则写了一半（还没写完）就当没命中
+        self._cache[text] = out
+        return out
+
+    def paint(self, painter, option, index):
+        text = str(index.data(Qt.ItemDataRole.DisplayRole) or '')
+        hits = self.matches(text)
+        if not hits:
+            super().paint(painter, option, index)
+            return
+        # 先把背景 / 选中 / 悬停那套原样画了（文字留空），再自己按命中段画文字
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ''
+        widget = opt.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+        rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemText, opt, widget)
+        if rect.width() <= 4:
+            return
+        painter.save()
+        painter.setClipRect(rect)
+        painter.setFont(opt.font)
+        metrics = painter.fontMetrics()
+        selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+        base = opt.palette.color(QPalette.ColorRole.HighlightedText if selected
+                                 else QPalette.ColorRole.Text)
+        line = metrics.height()
+        top = rect.top() + max(0, (rect.height() - line) // 2)
+        y = top + metrics.ascent()
+        x = rect.left()
+        pos = 0
+        for start, end in hits:
+            if start > pos:
+                chunk = text[pos:start]
+                painter.setPen(base)
+                painter.drawText(x, y, chunk)
+                x += metrics.horizontalAdvance(chunk)
+            chunk = text[start:end]
+            width = metrics.horizontalAdvance(chunk)
+            if selected:
+                painter.setPen(base)
+            else:
+                painter.fillRect(QRectF(x - 1, top, width + 2, line), self.HIGHLIGHT)
+                painter.setPen(self.HIGHLIGHT_TEXT)
+            painter.drawText(x, y, chunk)
+            x += width
+            pos = end
+        if pos < len(text):
+            painter.setPen(base)
+            painter.drawText(x, y, text[pos:])
+        painter.restore()
+
+
+def plan_patches(plan):
+    """更新计划里要依次盖上去的差分包列表（只有单个 patch 的老清单也认）。"""
+    items = [dict(item) for item in ((plan or {}).get('patches') or [])
+             if isinstance(item, dict) and item.get('url')]
+    if items:
+        return items
+    single = (plan or {}).get('patch') or {}
+    return [dict(single)] if isinstance(single, dict) and single.get('url') else []
+
+
 class MainWindow(QWidget):
     message = Signal(str)          # 后台线程 -> 界面 的日志
     progress = Signal(int, int)    # 演出进度
@@ -1447,6 +1711,10 @@ class MainWindow(QWidget):
         self.setMinimumSize(700, 560)
         self.resize(780, 700)
         self.setWindowIcon(make_icon())
+        self.setAcceptDrops(True)          # 拖 midi / mp3 到窗口里导入：见 dropEvent
+        _app = QApplication.instance()
+        if _app is not None:
+            _app.installEventFilter(self)  # 松手落在列表 / 输入框上也照样算数
 
         self.settings = QSettings('AutoPlay', 'AutoPlay')
         self.player = player.Player(log=self.message.emit)
@@ -1457,6 +1725,10 @@ class MainWindow(QWidget):
         self.tray = None
         self.hotkeys = None
         self.hotkey_timer = None
+        self._reward_window = None         # 「打赏作者」那个小窗口（懒创建）
+        self._audio_queue = []             # 一次拖进来好几段音频时排队转
+        self._audio_out = None             # 拖进来的音频转出来的 midi 存哪儿
+        self._keyboard_borrowed = False    # 曲库那一页开着的时候临时借了键盘（见 _borrow_keyboard）
         self.midi_path = None
         self.track_index = None
         self.last_dir = SONG_DIR if os.path.isdir(SONG_DIR) else os.getcwd()
@@ -1495,6 +1767,11 @@ class MainWindow(QWidget):
         self.hotkey_actions = {}       # 托盘菜单里的键位项（同上）
         self.overlay_active = False    # 现在是不是「浮层形态」（贴着游戏的那种窗口）
         self._maximized = False        # 主窗口现在最大化了没（编辑工程时铺满屏幕用）
+        self._ghost_rect = None        # 最小化前窗口占的那块屏幕：最小化完要擦一下，见 _erase_ghost
+        self._overlay_hidden_by_minimize = False   # 最小化的时候是不是顺手把进度浮窗收起来了
+        self._minimized_visual_done = False        # 这次最小化的收尾做过了没（见 _enter_minimized_visual_state）
+        self._overlay_suspended_for_minimize = False   # 为了最小化，临时把浮层形态切成普通窗口了没
+        self._minimize_busy = False                # 正在为最小化换形态（这时别理窗口状态事件）
         self._summoned_in_game = False # 这次是 Ctrl+F1 从游戏里唤起来的（决定用哪种选文件）
         self._game_hwnd = 0            # 唤起前占着全屏的那个窗口（游戏）：抢了前台要还给它
         self._watch_left = 0           # 前台兜底还能出手几次
@@ -1508,6 +1785,7 @@ class MainWindow(QWidget):
         self.remote_update = {}        # update.json 的内容（增量更新清单）
         self._update_why = ''          # 上面那份清单是拉到的还是没拉到
         self._update_plan = None       # 算好的更新计划（update.plan 的返回值）
+        self._update_hop = (1, 1, '', '')  # 多跳更新：现在下的是第几个包
         self._update_plan_ver = ''     # 这个计划是针对哪个版本的
         self._update_busy = False      # 正在准备 / 下载更新（防重入）
         self._update_body = ''         # 更新窗口里那段正文（下载进度在它上面刷）
@@ -1517,6 +1795,7 @@ class MainWindow(QWidget):
         self._news_started = False     # 只拉一次（手动「重新检查」会再拉）
         self._news_tried = 0           # 拉过几次（日志里说清楚）
         self._notices_read = set()     # 已经看过的公告 id（存在设置里）
+        self._update_seen = ''         # 已经「打过招呼」的新版本号（更新按钮的红点看它）
         self.editor = None             # 「主」编辑器窗口（第一次点「简谱编辑器…」才建）
         self._building_editor = False  # 正在建编辑器（防止标签页来回切时重入）
         self.editor_windows = []       # 另外开出来的编辑器窗口（外部双击工程文件时用）
@@ -1527,6 +1806,9 @@ class MainWindow(QWidget):
         self._preview_t0 = None        # 从哪一刻开始放的（自己数秒算进度）
         self._preview_base = 0.0       # 这一遍是从第几秒开始放的（拨过进度条就不是 0 了）
         self._preview_total = 0.0      # 试听总长（秒）
+        self._preview_seek = 0.0       # 合成完从第几秒开始放（换速度重合成时接着放）
+        self._preview_speed = 1.0      # 这次试听用的倍速（换速度时按它换算位置）
+        self._preview_token = 0        # 合成序号：换速度重合成时，旧的合成结果作废
         self.preview_timer = QTimer(self)
         self.preview_timer.setInterval(PREVIEW_TICK_MS)
         self.preview_timer.timeout.connect(self._preview_tick)
@@ -1587,7 +1869,8 @@ class MainWindow(QWidget):
         # 上次被强杀 / 崩了留下的自动保存：摆回编辑器（正常退出时是空的）
         self._restore_autosave(initial or '')
         # 公告 / 版本信息：等界面先露头，再悄悄去拉（拉不到就安静地算了）
-        QTimer.singleShot(500, self.fetch_news)
+        # 启动第一件事就是它：拉到就知道有没有新公告 / 新版本，按钮上点红点提醒
+        QTimer.singleShot(0, self.fetch_news)
 
     # ---------- 界面 ----------
 
@@ -1615,6 +1898,12 @@ class MainWindow(QWidget):
         title.setObjectName('title')
         subtitle = QLabel('选一个 midi，点开始演奏，然后切回游戏 · v%s' % APP_VERSION)
         subtitle.setObjectName('subtitle')
+        # 副标题是这一行里最长的文字：默认它会把「最小宽度」顶得很宽，窗口一窄
+        # 就把右边的「已就绪 / 主题 / 键位…」挤出去、甚至压在一起（1.0.7 修的）。
+        # 设成 Ignored：宽度不够时让这句先被裁掉，而不是把整行顶宽 —— 完整文字
+        # 放进 tooltip，鼠标停上去还能看全。
+        subtitle.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        subtitle.setToolTip('选一个 midi，点开始演奏，然后切回游戏')
         titles.addWidget(title)
         titles.addWidget(subtitle)
         head.addLayout(titles, 1)
@@ -1705,7 +1994,12 @@ class MainWindow(QWidget):
             'github', 'GitHub', lambda: self.open_link('github'),
             '用系统默认浏览器打开 GitHub 仓库：\n'
             'https://github.com/xXjuanneysXx/Auto-Midi-Player')
-        for button in (self.notice_btn, self.update_btn, self.bili_btn, self.github_btn):
+        self.reward_btn = self._neu_button(
+            'reward', '打赏作者', self.open_reward,
+            '觉得好用就打赏作者一杯奶茶 —— 请量力而行，未成年人请不要打赏。\n'
+            '点开是一个小窗口，里面有收款码。')
+        for button in (self.notice_btn, self.update_btn, self.bili_btn, self.github_btn,
+                       self.reward_btn):
             strip.addWidget(button, 0)
         strip.addStretch(1)
         self.version_tag = QLabel('v%s' % APP_VERSION)
@@ -1884,6 +2178,7 @@ class MainWindow(QWidget):
         self.speed.setFixedWidth(78)
         self.speed.setToolTip('整体快慢。1.0 是谱面原速；速度调快会把单音时长一起压短，\n'
                               '太快的话游戏可能又开始吞音')
+        self.speed.currentTextChanged.connect(self.on_speed_changed)   # 试听跟着一起换
         params.addWidget(self.speed)
         params.addStretch(1)
         body.addLayout(params)
@@ -1965,8 +2260,11 @@ class MainWindow(QWidget):
             self._refresh_repeat_label()
             body.addLayout(repeat_row)
 
-        # 再一行：跟「录制」「工程文件关联」有关的开关 + 「谁在响」
-        # （诊断按钮任何版本都有：这行就一定会建出来）
+        # 再一行：跟「录制」有关的开关 + 音长吸附。
+        # 这一行原来把「录制 / 关联 / 谁在响 / 显示演奏状态 / 出错自动上报」全塞在
+        # 一起，七八个控件挤在一行里，窗口一窄就互相压住、字被裁掉（1.0.7 修的
+        # 「最下面一行太挤」）。现在拆成两行：这一行只放录制相关的，
+        # 下面 opts3 放界面 / 工具类的开关。
         opts2 = QHBoxLayout()
         opts2.setSpacing(8)
         self.monitor_box = None
@@ -2001,6 +2299,13 @@ class MainWindow(QWidget):
                                        '「关」= 你按了多少毫秒就是多少毫秒。')
             self.snap_combo.currentTextChanged.connect(self.on_snap_changed)
             opts2.addWidget(self.snap_combo)
+        if opts2.count():
+            opts2.addStretch(1)
+            body.addLayout(opts2)
+
+        # 界面 / 工具类的那几个开关单独一行，别跟录制那行挤
+        opts3 = QHBoxLayout()
+        opts3.setSpacing(8)
         self.assoc_box = None
         # 关联要写注册表指向「本 exe」；源码运行时没有 exe 可指，这个勾选框就不露出来
         if edition.has_editor() and fileassoc.exe_of():
@@ -2009,13 +2314,13 @@ class MainWindow(QWidget):
                                       '程序会直接带着这个工程进「简谱编辑器」，不用先开程序再打开。\n'
                                       '只写在当前用户（HKCU）里，不需要管理员权限；取消勾选就撤掉。')
             self.assoc_box.toggled.connect(self.on_assoc_toggled)
-            opts2.addWidget(self.assoc_box)
+            opts3.addWidget(self.assoc_box)
         self.diag_button = QPushButton('🔔 谁在响')
         self.diag_button.setToolTip('录制时蹦出一声提示音，不知道谁干的？点它，然后正常按你的键：\n'
                                     '接下来 %d 秒里只要有程序出声，就把它的名字记到下面日志里。\n'
                                     '（再点一次就提前收工）' % int(DIAG_SECONDS))
         self.diag_button.clicked.connect(self.on_diag)
-        opts2.addWidget(self.diag_button)
+        opts3.addWidget(self.diag_button)
         # 「显示演奏状态」：**屏幕右上角那个演奏进度浮窗**（「已就绪 / 演奏中 12/345」）。
         # 默认显示；调试的时候嫌它挡视线，取消勾选就整个不弹出来（演奏、热键照常）。
         # 托盘菜单里的「显示 / 隐藏进度浮窗」跟这是同一个开关。
@@ -2025,9 +2330,20 @@ class MainWindow(QWidget):
                                     '跟托盘菜单里的「显示 / 隐藏进度浮窗」是同一个开关。')
         self.overlay_box.setChecked(self.overlay_on)
         self.overlay_box.toggled.connect(self.on_overlay_toggled)
-        opts2.addWidget(self.overlay_box)
-        opts2.addStretch(1)
-        body.addLayout(opts2)
+        opts3.addWidget(self.overlay_box)
+        # 「出错自动上报」：默认开。关掉之后出错只写本机日志，不往曲库仓库传。
+        self.error_report_box = QCheckBox('出错自动上报')
+        self.error_report_box.setToolTip(
+            '程序没接住的异常，自动打包成一份 json 传到曲库仓库的「错误报告」目录，\n'
+            '方便作者修 bug。\n'
+            '只传：版本、系统信息、异常类型和调用栈、路径里有没有中文。\n'
+            '不传：用户名、完整路径、歌名这些能定位到个人的东西（路径会被替换成 <path>）。\n'
+            '一次运行最多传 3 条；不想传就取消勾选（本机日志照旧写）。')
+        self.error_report_box.setChecked(errorreport.enabled())
+        self.error_report_box.toggled.connect(self.on_error_report_toggled)
+        opts3.addWidget(self.error_report_box)
+        opts3.addStretch(1)
+        body.addLayout(opts3)
 
         bar_row = QHBoxLayout()
         bar_row.setSpacing(10)
@@ -2073,6 +2389,13 @@ class MainWindow(QWidget):
         self.hint.setObjectName('hint')
         self.hint.setWordWrap(True)      # 键位提示会随自定义变长，换行别把窗口撑宽
         root.addWidget(self.hint)
+
+        # 兜一道宽度：窗口**最小宽度**不许小于「任何一行真正需要的宽度」，免得
+        # 被拖窄之后控件互相压住、文字被裁（1.0.7 修的「底部一行挤在一起」就是
+        # 这个毛病）。按当前字体的真实 measure 算 —— 高分屏、系统缩放 125/150%
+        # 的时候自动跟着变宽。上限 880：再宽就太占屏幕了，剩下的交给控件自己收缩。
+        need = root.minimumSize().width() + 6
+        self.setMinimumWidth(int(max(700, min(need, 880))))
 
         # 编辑器改成独立窗口了（见 open_editor）：点「简谱编辑器…」直接开一个新窗口，
         # 跟主界面互不打扰、能最小化、不置顶。所以主界面不再有那一页，标签栏只剩
@@ -2136,6 +2459,7 @@ class MainWindow(QWidget):
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.setIconSize(QSize(17, 17))
         button.setToolTip(tip)
+        button._base_tip = tip            # 记着原提示：有新版本时要在前面加一句（见 _refresh_icons）
         button.clicked.connect(slot)
         self._set_button_icon(button, icon_name)
         return button
@@ -2145,10 +2469,19 @@ class MainWindow(QWidget):
         for button, icon_name in ((getattr(self, 'notice_btn', None), 'announce'),
                                   (getattr(self, 'update_btn', None), 'update'),
                                   (getattr(self, 'bili_btn', None), 'bilibili'),
-                                  (getattr(self, 'github_btn', None), 'github')):
+                                  (getattr(self, 'github_btn', None), 'github'),
+                                  (getattr(self, 'reward_btn', None), 'reward')):
             if button is None:
                 continue
-            dot = (icon_name == 'announce' and self._has_unread_notice())
+            if icon_name == 'announce':
+                dot = self._has_unread_notice()
+            elif icon_name == 'update':
+                dot = self._has_update_notice()
+                base = str(getattr(button, '_base_tip', '') or '')
+                latest = str((self.remote_version or {}).get('latest') or '')
+                button.setToolTip(('有新版本 v%s 可以更新。\n%s' % (latest, base)) if dot else base)
+            else:
+                dot = False
             self._set_button_icon(button, icon_name, dot=dot)
 
     def _has_unread_notice(self):
@@ -2157,6 +2490,30 @@ class MainWindow(QWidget):
             if nid and nid not in self._notices_read:
                 return True
         return False
+
+    def _has_update_notice(self):
+        """「更新」按钮上要不要点红点：仓库说有新版，而且这个版本号还没跟用户打过招呼。
+
+        拉到 version.json / update.json 之后就知道了最新版是多少（启动时后台拉，见
+        fetch_news），不用用户去点「更新」才发现。点开更新窗口就算「打过招呼」，
+        红点收掉 —— 跟公告「看过就不再提醒」是一个道理，免得红点一直挂着像坏了。
+        """
+        latest = str((self.remote_version or {}).get('latest') or '')
+        if not latest or not notice_mod.is_newer(latest, APP_VERSION):
+            return False
+        return latest != str(getattr(self, '_update_seen', '') or '')
+
+    def _mark_update_seen(self, latest):
+        """这个新版本号已经跟用户打过招呼了（记在设置里），顺手把红点收掉。"""
+        latest = str(latest or '')
+        if not latest or latest == str(getattr(self, '_update_seen', '') or ''):
+            return
+        self._update_seen = latest
+        try:
+            self.settings.setValue('update_seen', latest)
+        except Exception:
+            pass
+        self._refresh_icons()
 
     def _load_notices_read(self):
         """哪些公告已经看过了（记在设置里，按公告的 id）。"""
@@ -2172,6 +2529,13 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
+    def _load_update_seen(self):
+        """上次已经「打过招呼」的新版本号（顶部「更新」按钮的红点靠它消掉）。"""
+        try:
+            self._update_seen = str(self.settings.value('update_seen', '') or '')
+        except Exception:
+            self._update_seen = ''
+
     def fetch_news(self):
         """去曲库仓库拉 version.json / notice.json（后台线程，几秒超时，失败静默）。"""
         if getattr(self, '_news_busy', False):
@@ -2183,6 +2547,10 @@ class MainWindow(QWidget):
     def _fetch_news_worker(self):
         version, why_v = {}, ''
         items, why_n = [], ''
+        try:                                      # 顺手把错误上报的配置拉一份（谁都能改）
+            errorreport.refresh()
+        except Exception:
+            pass
         try:
             version, why_v = notice_mod.version_info()
         except Exception as error:
@@ -2258,6 +2626,44 @@ class MainWindow(QWidget):
         self.log('用浏览器打开：%s' % target)
         QDesktopServices.openUrl(QUrl(target))
 
+    def open_reward(self):
+        """「打赏作者」：开一个独立小窗口（能最小化、能关；主窗口置顶时它也跟着置顶）。"""
+        window = self._reward_window
+        if window is None:
+            window = RewardWindow()
+            self._reward_window = window
+        self._present_popup(window)
+
+    def _popup_on_top(self):
+        """主窗口现在是「置顶浮层」吗？是的话弹窗也得跟着置顶，不然会被它压住。"""
+        try:
+            if getattr(self, 'overlay_active', False):
+                return True
+            return bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
+        except Exception:
+            return False
+
+    def _present_popup(self, window):
+        """
+        把独立小窗口（公告 / 更新 / 打赏）真的顶到最前面。
+
+        主窗口默认就是「总在最前 + 不抢焦点」的浮层，普通弹窗只会被它压在下面 ——
+        所以主窗口置顶时，弹窗也跟着置顶，并且走 force_window_front（AttachThreadInput
+        那一套）抢前台；不然游戏在前面时弹窗压根冒不出来。
+        """
+        on_top = self._popup_on_top()
+        try:
+            window.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on_top)
+        except Exception:
+            pass
+        window.show()                     # setWindowFlag 会把它藏一下，show 回来
+        if on_top:
+            force_window_front(window)    # 置顶 + 抢前台：游戏在前面也压得住
+        else:
+            window.raise_()
+            window.activateWindow()
+        window.raise_()
+
     def _show_info_panel(self, kind, title, body, actions):
         """公告 / 更新：开一个独立窗口（不贴在主界面里，免得把上面的卡片挤小）。"""
         if self._choosing is not None:            # 曲库那一页开着就先收掉，别叠在一起
@@ -2269,9 +2675,7 @@ class MainWindow(QWidget):
             self.info_window = window
         window.set_content(title, body, actions)
         self._info_kind = kind
-        window.show()
-        window.raise_()
-        window.activateWindow()
+        self._present_popup(window)
 
     def _info_visible(self):
         """公告 / 更新那个窗口现在是不是开着。"""
@@ -2340,6 +2744,8 @@ class MainWindow(QWidget):
         version = dict(self.remote_version or {})
         latest = str(version.get('latest') or '')
         newer = bool(latest) and notice_mod.is_newer(latest, APP_VERSION)
+        if newer:
+            self._mark_update_seen(latest)     # 打开展示过了：更新按钮上的红点收掉
         lines = ['当前版本：v%s' % APP_VERSION]
         if latest:
             lines.append('最新版本：v%s%s' % (latest, '        （有新版本！）' if newer else ''))
@@ -2422,6 +2828,7 @@ class MainWindow(QWidget):
             # update.json 说还有更新的版本：以它为准（version.json 没跟上也不耽误更新）
             self.remote_version['latest'] = latest
             self._refresh_version_tag()
+            self._refresh_icons()          # 更新按钮的红点跟着起来
         if self._info_visible() and self._info_kind == 'update' and not self._update_busy:
             self.open_update(force=True)
 
@@ -2438,15 +2845,32 @@ class MainWindow(QWidget):
         mode = str(plan.get('mode') or '')
         latest = str(plan.get('latest') or self._update_plan_ver or '')
         if mode == 'patch':
-            patch = plan.get('patch') or {}
-            size = float(patch.get('size') or 0) / 1048576.0
+            patches = plan_patches(plan)
+            size = sum(float(patch.get('size') or 0) for patch in patches) / 1048576.0
+            if len(patches) > 1:
+                route = ' → '.join(['v%s' % str(patch.get('from') or '?')
+                                    for patch in patches] + ['v%s' % latest])
+                head = ('可以分 %d 步增量更新（%s）：只下各版之间变化的文件（一共 %.1f MB），'
+                        '不用重下整个安装包。' % (len(patches), route, size))
+            else:
+                head = ('可以增量更新：只下 v%s 新改的那些文件（%.1f MB），不用重下整个安装包。'
+                        % (latest, size))
             self._render_update(
-                ['可以增量更新：只下 v%s 新改的那些文件（%.1f MB），不用重下整个安装包。' % (latest, size),
-                 '',
+                [head, '',
                  '点「立即更新」：下好之后程序会自己退出、换好文件，再自己开回来。'],
                 self._update_buttons('patch', plan))
         elif mode == 'none':
-            self._render_update(['已经是最新版本，不用更新。'], self._update_buttons())
+            noticed = str((self.remote_version or {}).get('latest') or '')
+            if notice_mod.is_newer(noticed, APP_VERSION):
+                # version.json 说有新版，但 update.json 里的版本号还是旧的 —— 清单没跟上。
+                # 拿不到增量包不等于没有更新，退回「去下载」这条路（红点也是这么来的）。
+                self._render_update(
+                    ['版本信息说已经有 v%s 了，但更新清单里还没有这一版（清单还没跟上）。' % noticed,
+                     '这一版没有能直接用的增量包，点「去下载」用浏览器打开 B站主页'
+                     '（下载链接发在那儿）；下载完直接装（装的时候会覆盖旧版）。'],
+                    self._update_buttons('full'))
+            else:
+                self._render_update(['已经是最新版本，不用更新。'], self._update_buttons())
         elif mode == 'full':
             self._render_update(
                 ['这一版没有能直接用的增量包（差得太多，或者差分包还没传上来）。',
@@ -2474,40 +2898,80 @@ class MainWindow(QWidget):
                          daemon=True).start()
 
     def _run_incremental_update(self, plan):
-        patch = plan.get('patch') or {}
+        # 这份清单可能是启动那会儿拉的旧货（CDN 缓存 / 在内存里放了很久）：真下载之前
+        # 按最新清单再算一遍。不然会出现「清单里写的大小跟下下来的包对不上」——
+        # 差分包地址是同一个，仓库那边换了新包，旧清单就校验不过（实测踩过）。
+        try:
+            fresh, _why = notice_mod.update_info(version=dict(self.remote_version or {}))
+        except Exception:
+            fresh = {}
+        if fresh:
+            again = update_mod.plan(APP_VERSION, app_dir(), data=fresh)
+            if str(again.get('mode') or '') == 'none':
+                self.update_done.emit('', '刷新了一下更新清单：现在不需要更新了。')
+                return
+            if str(again.get('mode') or '') == 'patch' and plan_patches(again):
+                plan = again
+                self.remote_update = dict(fresh)
+        patches = plan_patches(plan)
+        if not patches:
+            self.update_done.emit('', '清单里没有能用的差分包地址。')
+            return
         latest = str(plan.get('latest') or '')
-        url = str(patch.get('url') or '')
-        name = os.path.basename(url.split('?')[0]) or ('AutoPlay-patch-%s.zip' % latest)
         folder = update_mod.patch_dir()
         try:
             os.makedirs(folder, exist_ok=True)
         except OSError as error:
             self.update_done.emit('', '建不了临时目录：%s' % error)
             return
-        path, why = update_mod.download(
-            url, os.path.join(folder, name),
-            progress=lambda got, total: self.update_progress.emit(got, total),
-            expect_size=patch.get('size') or 0,
-            expect_sha=patch.get('sha256') or '')
-        if why:
-            self.update_done.emit('', why)
-            return
-        _runner, why = update_mod.launch_updater(path, app_dir(), latest,
+        paths = []
+        count = len(patches)
+        for index, patch in enumerate(patches, 1):
+            url = str(patch.get('url') or '')
+            name = (os.path.basename(url.split('?')[0])
+                    or ('AutoPlay-patch-%s-%d.zip' % (latest, index)))
+            self._update_hop = (index, count, str(patch.get('from') or ''),
+                                str(patch.get('to') or ''))
+            path, why = update_mod.download(
+                url, os.path.join(folder, name),
+                progress=lambda got, total: self.update_progress.emit(got, total),
+                expect_size=patch.get('size') or 0,
+                expect_sha=patch.get('sha256') or '')
+            if why:
+                hint = ''
+                if ('大小不对' in why) or ('sha256' in why):
+                    hint = '（这份清单可能不是最新的：点「重新检查」刷新一下再试）'
+                if count > 1:
+                    why = '第 %d/%d 个包：%s' % (index, count, why)
+                self.update_done.emit('', why + hint)
+                return
+            paths.append(path)
+        _runner, why = update_mod.launch_updater(paths, app_dir(), latest,
                                                  pid=os.getpid(), relaunch=True)
         if why:
             self.update_done.emit('', why)
             return
-        self.update_done.emit(
-            '更新包已经下好了（%s）。程序这就退出，更新器会换好文件再把它开回来。'
-            % os.path.basename(path), '')
+        if len(paths) > 1:
+            note = ('%d 个更新包已经下好了（%s）。程序这就退出，更新器会按顺序换好文件，'
+                    '再把它开回来。' % (len(paths),
+                                        '、'.join(os.path.basename(item) for item in paths)))
+        else:
+            note = ('更新包已经下好了（%s）。程序这就退出，更新器会换好文件再把它开回来。'
+                    % os.path.basename(paths[0]))
+        self.update_done.emit(note, '')
 
     def _on_update_progress(self, got, total):
         """下载差分包：把进度刷在更新窗口的正文上。"""
+        index, count, src, dst = getattr(self, '_update_hop', (1, 1, '', ''))
+        prefix = '正在下载更新包'
+        if count > 1:
+            prefix = '正在下载第 %d/%d 个更新包（%s → %s）' % (index, count, src, dst)
         if total:
-            text = '正在下载更新包… %.1f / %.1f MB（%d%%）' % (
-                got / 1048576.0, total / 1048576.0, int(got * 100.0 / max(1, total)))
+            text = '%s… %.1f / %.1f MB（%d%%）' % (
+                prefix, got / 1048576.0, total / 1048576.0,
+                int(got * 100.0 / max(1, total)))
         else:
-            text = '正在下载更新包… 已下 %.1f MB' % (got / 1048576.0)
+            text = '%s… 已下 %.1f MB' % (prefix, got / 1048576.0)
         self._update_tail = [text, '', '下载完程序会自动退出、换好文件再自己开回来。']
         window = getattr(self, 'info_window', None)
         if window is None or not (self._info_visible() and self._info_kind == 'update'):
@@ -2653,7 +3117,7 @@ class MainWindow(QWidget):
 
     def _overlay_after_finish(self):
         """浮窗把结果亮完之后：有谱面就切回「已就绪」并继续显示，否则收起来。"""
-        if self.overlay_on and self.score_events:
+        if self.overlay_on and self.score_events and not self.isMinimized():
             self.overlay.set_ready(len(self.score_events))
             return True
         return False
@@ -2719,31 +3183,42 @@ class MainWindow(QWidget):
             visible = self.isVisible()
             pos = self.pos()
             self.overlay_active = bool(overlay)
+            borrowed = (bool(getattr(self, '_keyboard_borrowed', False))
+                        and self.overlay_active)
             flags = Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
             if self.overlay_active:
-                flags |= Qt.WindowType.WindowDoesNotAcceptFocus
+                if not borrowed:           # 曲库那一页还开着：键盘是借来的，别把焦点锁死
+                    flags |= Qt.WindowType.WindowDoesNotAcceptFocus
                 # 浮层永远置顶：它就是贴着游戏的一小块。编辑器已经是独立窗口了，
                 # 不用再为它让路（见 open_editor）。
                 flags |= Qt.WindowType.WindowStaysOnTopHint
-                self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+                self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, not borrowed)
                 self.setWindowOpacity(self._overlay_opacity())
             else:
                 self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
                 self.setWindowOpacity(OVERLAY_OPACITY_EDITOR)
             self.setWindowFlags(flags)
             self._topmost_on = None          # 标志重设过了，置顶状态得重新算一遍
+            # setWindowFlags 会重建原生窗口：拖放目标（OLE drop site）跟着一起重挂一遍，
+            # 不然拖文件进窗口会变成「禁止」光标 —— 明明 setAcceptDrops 过。
+            self.setAcceptDrops(True)
+            allow_lower_privilege_drop(self)
             # 再手动补一层：Qt 万一没认这个位，咱自己保证它一定在。
-            set_no_activate(self, self.overlay_active)
+            set_no_activate(self, self.overlay_active and not borrowed)
             # 关闭 / 最小化 / 最大化这三个（以及键位）现在常显：桌面用着也能一键
             # 收进托盘后台，不用回托盘菜单。
             self.setProperty('cover', 'true' if self.cover_mode else 'false')
             self.style().unpolish(self)      # 动态属性改了要重新套一遍样式
             self.style().polish(self)
             if visible:                    # setWindowFlags 会把窗口藏起来，得重新显示
+                # 一定要走 Qt 自己的 show()：setWindowFlags 重建窗口之后 Qt 认为这个
+                # 窗口是「藏起来」的，只用 Win32 的 ShowWindow 把它显示出来，Qt 那边
+                # 不认 —— 界面不画、isVisible() 还是 False。从任务栏点回来的时候就是
+                # 这个毛病：系统明明把窗口还原了（IsIconic=0），屏幕上却什么都没有。
+                # 浮层形态靠上面那行 WA_ShowWithoutActivating 保证 show() 也不抢游戏前台。
+                self.show()
                 if self.overlay_active:
-                    show_no_activate(self)  # 要显示，但绝不抢前台
-                else:
-                    self.show()
+                    show_no_activate(self)  # 再补一刀：确保置顶 + 不激活
                 self.move(pos)
                 if self._maximized and not self.overlay_active:
                     self.showMaximized()   # 换个形态别把最大化弄丢了
@@ -2760,6 +3235,8 @@ class MainWindow(QWidget):
         """换页之后把浮层不透明度补上（编辑器页要变回不透明）。"""
         if not getattr(self, 'overlay_active', False):
             return
+        if self.isMinimized():
+            return          # 最小化时是刻意做成不透明的，别又把 layered 加回去
         try:
             self.setWindowOpacity(self._overlay_opacity())
         except Exception:
@@ -2998,12 +3475,165 @@ class MainWindow(QWidget):
             log_event('主窗口最大化')
 
     def minimize_window(self):
-        """最小化：正常的窗口最小化，任务栏里还看得见（跟「关闭」不一样）。"""
+        """
+        最小化：正常的窗口最小化，任务栏里还看得见（跟「关闭」不一样）。
+
+        这里要绕一个 Windows 的坑：浮层形态的窗口是**半透明**的（setWindowOpacity），
+        半透明会让系统给它加一层 layered 窗口；这种窗口最小化的时候，系统不一定把
+        留在桌面上的那一层擦掉，屏幕上就会剩一块「残影」，得点一下别的窗口才消失。
+        所以最小化之前先把不透明度恢复成 1.0（等于把那层拆掉），窗口回来之后再补上；
+        顺手把原来占的那块屏幕区域标脏，让系统重画一遍兜底。
+
+        还有一个更阴的坑：浮层窗口带着 WS_EX_NOACTIVATE，**系统不给它任务栏按钮**，
+        最小化的飞行动画就没有落点，Windows 会把窗口最后那幅画面留在桌面上，任务栏里
+        也找不到它 —— 所以最小化前会先把窗口切成普通窗口（见
+        _enter_minimized_visual_state）。
+
+        另外把右上角那个进度浮窗一起收起来 —— 窗口都进任务栏了，桌上再留一颗
+        「已就绪」看着就像没关干净（正在演奏时不收：那是唯一能看进度的地方）。
+        """
         try:
-            self.showMinimized()
+            self._enter_minimized_visual_state()
             log_event('主窗口最小化')
         except Exception as exc:
             self.log('最小化失败：%s' % exc)
+
+    def _enter_minimized_visual_state(self):
+        """
+        最小化的时候要做的收尾（「—」、Win+D、任务栏右键都走这儿）：
+        记下要擦的屏幕区域 → 收起进度浮窗 → **换成普通窗口** → 拆掉半透明那层 →
+        最小化 → 过一会儿擦残影。
+
+        为什么要「换成普通窗口」：浮层配方给窗口挂了 WS_EX_NOACTIVATE（点它不抢游戏
+        焦点），而带这个位的窗口**在窗口创建的那一刻就被系统判成「不进任务栏」**，
+        事后补 WS_EX_APPWINDOW 也补不回来（实测：任务栏那一行像素从头到尾一模一样，
+        UIA 里也找不到按钮）。没有任务栏按钮，最小化动画就没有落点，Windows 会把窗口
+        最后那幅画面丢在桌面上（实测：屏幕左边留一条标题栏残影），任务栏里也找不到它。
+        所以最小化前先用 _apply_window_mode(False) 把窗口**重建成普通窗口**（任务栏
+        这时候才认它），还原的时候再切回浮层。
+
+        一次最小化只做一遍：Windows 有时候会连着扔好几个状态事件过来，重复做不但
+        白费劲，还会把「浮窗是这次收起来的」这个标记洗掉，还原之后浮窗就回不来了。
+        （_minimized_visual_done 在 _restore_after_minimize 里清掉，下次最小化照常。）
+        """
+        if self._minimized_visual_done:
+            return
+        self._minimized_visual_done = True
+        self._capture_ghost_rect()
+        self._hide_overlay_for_minimize()
+        self._minimize_busy = True
+        try:
+            if getattr(self, 'overlay_active', False):
+                # 先藏起来再换：setWindowFlags 会重建窗口，藏着换完屏幕上不会闪
+                self._overlay_suspended_for_minimize = True
+                self.hide()
+                self._apply_window_mode(False)
+            try:
+                self.setWindowOpacity(1.0)      # 拆掉 layered，免得留下残影
+            except Exception:
+                pass
+            set_taskbar_window(self, True)      # 任务栏得有它，最小化动画才有落点
+            self.showMinimized()
+            # Qt 在「窗口刚重建过」的时候不一定真把窗口缩下去（setWindowState 只在
+            # 窗口可见时才转成 ShowWindow(SW_MINIMIZE)）。直接问系统一句，没缩就补一刀。
+            try:
+                user32 = ctypes.windll.user32
+                hwnd = ctypes.c_void_p(int(self.winId()))
+                if hwnd and not user32.IsIconic(hwnd):
+                    user32.ShowWindow(hwnd, 6)      # SW_MINIMIZE
+            except Exception:
+                pass
+        finally:
+            self._minimize_busy = False
+        QTimer.singleShot(60, self._erase_ghost)   # 等缩下去的动画走完再擦那块
+
+    def _capture_ghost_rect(self):
+        """
+        记下最小化前「窗口 + 进度浮窗」一起占掉的屏幕区域。
+
+        残留不止主窗口自己那一块：右上角那个进度浮窗是独立置顶窗口，主窗口缩下去
+        之后它还会留在桌面上，所以两块都要擦。这里把两个矩形并成一个再存。
+        """
+        try:
+            rect = self._window_rect_for_ghost()
+            if self.overlay.isVisible():
+                rect = rect.united(self.overlay.frameGeometry())
+            self._ghost_rect = (rect.left(), rect.top(), rect.right() + 1, rect.bottom() + 1)
+        except Exception:
+            self._ghost_rect = None
+
+    def _window_rect_for_ghost(self):
+        """
+        主窗口「正常时候」占的屏幕区域。
+
+        注意：窗口已经缩下去之后 frameGeometry() 在 Windows 上会变成 (-32000, -32000)
+        这种占位坐标，拿它去擦残影没用。所以一旦发现是这种离谱坐标，就改用
+        normalGeometry()（Qt 记着的「没最大化也没最小化时」的位置）。
+        """
+        rect = self.frameGeometry()
+        if rect.left() < -30000 or rect.top() < -30000:
+            rect = self.normalGeometry()
+        return rect
+
+    def _hide_overlay_for_minimize(self):
+        """
+        最小化时把进度浮窗收起来（正在演奏就不动，那是唯一能看进度的地方）。
+
+        收起来了就把标记立起来，还原的时候好按标记把它补回去；已经立着就直接返回，
+        免得第二次调用把标记又抹平。
+        """
+        if getattr(self, '_overlay_hidden_by_minimize', False):
+            return
+        try:
+            if self.overlay_on and self.overlay.isVisible() and not self._playing():
+                self.overlay.shutdown()
+                self._overlay_hidden_by_minimize = True
+        except Exception:
+            pass
+
+    def _restore_after_minimize(self):
+        """窗口从最小化回来了：把「任务栏形态」、不透明度和进度浮窗都补回该有的样子。"""
+        if self.isMinimized():
+            return          # 还在最小化（换形态时也会来状态事件），这会儿别急着复原
+        self._minimized_visual_done = False
+        self._erase_ghost()
+        if getattr(self, '_overlay_suspended_for_minimize', False):
+            self._overlay_suspended_for_minimize = False
+            self._minimize_busy = True
+            try:
+                # 之前为了最小化切成了普通窗口，现在按用户原来的设置切回去（浮层 / 普通）
+                self._apply_window_mode(self.cover_mode)
+            finally:
+                self._minimize_busy = False
+            set_taskbar_window(self, not self.overlay_active)
+        try:
+            self.setWindowOpacity(self._overlay_opacity() if self.overlay_active
+                                  else OVERLAY_OPACITY_EDITOR)
+        except Exception:
+            pass
+        if getattr(self, '_overlay_hidden_by_minimize', False):
+            self._overlay_hidden_by_minimize = False
+            if self.overlay_on and self.score_events:
+                try:
+                    self.overlay.set_ready(len(self.score_events))
+                except Exception:
+                    pass
+
+    def _erase_ghost(self):
+        """把最小化前那块屏幕标脏，让 Windows 重画 —— 擦掉 layered 窗口留下的残影。"""
+        rect = self._ghost_rect
+        self._ghost_rect = None
+        if not rect:
+            return
+        try:
+            class _RECT(ctypes.Structure):
+                _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
+                            ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+            ctypes.windll.user32.RedrawWindow(
+                None, ctypes.byref(_RECT(*rect)), None,
+                0x0001 | 0x0004 | 0x0080 | 0x0100)   # 标脏|擦背景|连子窗口|立刻重画
+        except Exception:
+            pass
 
     def _refresh_max_button(self):
         """右上角那个按钮：按状态换字、换配色和提示。"""
@@ -3023,11 +3653,19 @@ class MainWindow(QWidget):
                 pass
 
     def changeEvent(self, event):
-        """盯着「是不是最大化了」，按钮上的字跟着变。"""
+        """盯着窗口状态：按钮上的字跟着变；从最小化回来要把不透明度和浮窗补上。"""
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange:
             self._maximized = bool(self.windowState() & Qt.WindowState.WindowMaximized)
             self._refresh_max_button()
+            if getattr(self, '_minimize_busy', False):
+                return          # 正在为最小化换形态：中间那几次状态事件别当真的用
+            if self.windowState() & Qt.WindowState.WindowMinimized:
+                # 不是点「—」最小化的（Win+D、任务栏右键这些）也走这里补一刀：
+                # 半透明窗口最小化容易留残影，先把那层拆掉再擦一遍。
+                self._enter_minimized_visual_state()
+            else:
+                self._restore_after_minimize()
 
     def _drop_topmost(self):
         """唤起之后过一阵：窗口已经不在用了就撤掉「总在最前」，别一直挡着游戏。"""
@@ -3189,6 +3827,7 @@ class MainWindow(QWidget):
         没有存过设置就用各项的默认值（见各自的 DEFAULT）。
         """
         self._load_notices_read()      # 哪些公告已经看过（记在设置里，顶部铃铛的红点看它）
+        self._load_update_seen()       # 哪个新版本已经打过招呼（顶部「更新」的红点看它）
         if FOLLOW_MODE:
             self.follow_on = bool(self.settings.value('follow', False, type=bool))
             if self.follow_pos is not None:
@@ -3278,6 +3917,11 @@ class MainWindow(QWidget):
     def on_overlay_toggled(self, enabled):
         """「显示演奏状态」勾选框：记进设置，并且立刻显示 / 隐藏那个浮窗。"""
         self.set_overlay_visible(enabled)
+
+    def on_error_report_toggled(self, enabled):
+        """「出错自动上报」勾选框：记在本机（默认开），下次出错就照它办。"""
+        errorreport.set_enabled(bool(enabled))
+        self.log('出错自动上报：%s' % ('开' if enabled else '关'))
 
     def set_overlay_visible(self, enabled, save=True):
         """
@@ -3698,6 +4342,121 @@ class MainWindow(QWidget):
 
     # ---------- 转换 ----------
 
+    def _borrow_keyboard(self, on):
+        """
+        浮层形态的窗口**收不到键盘**（点它不抢游戏焦点，这是刻意设计的）—— 所以贴在里面
+        的搜索框、输入框都打不了字。
+
+        打开「曲库 / 选文件」这一页时，如果人不在游戏里，就临时把窗口变回「能接收键盘」：
+        桌面上抢焦点没有任何副作用。人真在游戏里就不动（在那儿本来也不该打字），搜索框会
+        置灰并写明白。关掉这一页时原样还回去（浮层：不抢焦点 + 置顶）。
+        """
+        on = bool(on)
+        self._keyboard_borrowed = on
+        if not getattr(self, 'overlay_active', False):
+            return                          # 普通窗口本来就能打字
+        try:
+            visible = self.isVisible()
+            flags = self.windowFlags()
+            if on:
+                flags &= ~Qt.WindowType.WindowDoesNotAcceptFocus
+            else:
+                flags |= Qt.WindowType.WindowDoesNotAcceptFocus
+            self.setWindowFlags(flags)
+            self.setAcceptDrops(True)       # 标志重设后拖放目标重挂一遍
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, not on)
+            set_no_activate(self, not on)
+            if visible:
+                self.show()                 # setWindowFlags 会把窗口藏一下
+            if on:
+                force_window_front(self)    # 桌面上：抢前台，键盘才进得来
+            else:
+                set_topmost(self, True)     # 还回浮层：置顶 + 不激活
+                show_no_activate(self)
+                self._topmost_on = True
+            log_event('搜索键盘模式：%s' % ('开（桌面上临时让窗口能接收键盘）' if on else '关'))
+        except Exception as exc:
+            log_event('切换搜索键盘模式出错：%s' % exc)
+
+    def _add_search_row(self, box, list_widget, placeholder):
+        """
+        在列表上面插一条搜索栏：放大镜图标 + 关键字 + 「正则」勾选框。
+
+        命中的条目留下、没命中的藏起来，命中的那一段换个底色（见 SearchDelegate）。
+        关键字空着就显示全部。
+        """
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        edit = QLineEdit()
+        edit.setPlaceholderText(placeholder)
+        edit.setClearButtonEnabled(True)
+        edit.setToolTip('按曲名 / 歌手过滤；命中的那一段会高亮。\n'
+                        '勾「正则」就按正则表达式匹配（例如 ^钢琴|piano$）。')
+        can_type = (not getattr(self, 'overlay_active', False)
+                    or bool(getattr(self, '_keyboard_borrowed', False)))
+        if not can_type:
+            # 游戏里的浮层不抢焦点、收不到键盘 —— 与其让人点了打不出字，不如置灰说清楚
+            edit.setEnabled(False)
+            edit.setPlaceholderText('游戏里没法打字：回桌面再用搜索')
+            edit.setToolTip('浮层模式（刻意不抢游戏焦点）下窗口收不到键盘，所以游戏里搜不了。\n'
+                            '回桌面再点「曲库」，搜索栏就能打字了。')
+        try:
+            edit.addAction(uiicons.make_icon('search', self._icon_color(), 15,
+                                             bg=self._icon_bg()),
+                           QLineEdit.ActionPosition.LeadingPosition)
+        except Exception:
+            pass
+        regex_box = QCheckBox('正则')
+        regex_box.setToolTip('勾上：关键字按正则表达式匹配（例如 ^钢琴|piano$）；\n'
+                             '不勾：普通关键字，曲名 / 歌手里包含它就算命中。')
+        row.addWidget(edit, 1)
+        row.addWidget(regex_box, 0)
+        if not can_type:
+            regex_box.setEnabled(False)
+        box.addLayout(row)
+
+        delegate = SearchDelegate(list_widget)
+        list_widget.setItemDelegate(delegate)
+
+        def apply(*_args):
+            if list_widget is not getattr(self, 'pick_list', None):
+                return                     # 面板已经收掉了
+            term = edit.text()
+            delegate.set_term(term, regex_box.isChecked())
+            total, hits = 0, 0
+            for index in range(list_widget.count()):
+                item = list_widget.item(index)
+                total += 1
+                ok = bool(delegate.matches(item.text())) if term else True
+                item.setHidden(not ok)
+                if term and ok:
+                    hits += 1
+            try:
+                list_widget.viewport().update()
+            except Exception:
+                pass
+            hint = getattr(self, 'pick_hint', None)
+            if hint is not None:
+                if term:
+                    if not getattr(self, '_pick_hint_saved', False):
+                        self._pick_hint_base = hint.text()
+                        self._pick_hint_saved = True
+                    hint.setText('命中 %d 个（共 %d 个）' % (hits, total))
+                elif getattr(self, '_pick_hint_saved', False):
+                    # 关键字清空：把原来那句提示还回去（不是留一句「命中 0 个」）
+                    if getattr(self, '_pick_hint_base', ''):
+                        hint.setText(self._pick_hint_base)
+                    self._pick_hint_saved = False
+            if (self._pick_mode == 'online'
+                    and getattr(self, 'pick_ok', None) is not None):
+                self.pick_ok.setEnabled(any(not list_widget.item(i).isHidden()
+                                            for i in range(list_widget.count())))
+
+        edit.textChanged.connect(apply)
+        regex_box.toggled.connect(apply)
+        self._pick_search_apply = apply
+        return edit, regex_box
+
     # ---------- 联网曲库 ----------
 
     def open_online_library(self):
@@ -3715,6 +4474,7 @@ class MainWindow(QWidget):
             self._close_picker()          # 上次没收干净就先收拾掉
         self._hide_info_panel()           # 公告 / 更新那页开着就先收掉，别叠在一起
         self._pick_mode = 'online'
+        self._borrow_keyboard(not self.in_game())   # 桌面上让窗口能接收键盘，搜索框才打得进去
         panel = QWidget(self.pick_panel)
         box = QVBoxLayout(panel)
         box.setContentsMargins(0, 0, 0, 0)
@@ -3746,6 +4506,7 @@ class MainWindow(QWidget):
         box.addLayout(bar)
 
         self.pick_list = QListWidget()
+        self._add_search_row(box, self.pick_list, '搜索曲名 / 歌手（命中的会高亮）')
         box.addWidget(self.pick_list, 1)
 
         self.pick_hint = QLabel('')
@@ -3778,6 +4539,7 @@ class MainWindow(QWidget):
 
         def fill(songs, message):
             self.pick_list.clear()
+            self._pick_hint_saved = False      # 新的一批，搜索栏那句「命中 N 个」重新算
             for song in songs:
                 bits = [str(song.get('title') or ''), str(song.get('artist') or '')]
                 size = int(song.get('size') or 0)
@@ -3790,6 +4552,8 @@ class MainWindow(QWidget):
                 self.pick_list.addItem(item)
             self.pick_hint.setText(message)
             self.pick_ok.setEnabled(bool(self.pick_list.count()))
+            if getattr(self, '_pick_search_apply', None) is not None:
+                self._pick_search_apply()       # 搜索框里还留着字就照着再筛一遍
 
         def reload(_checked=False):
             if self.pick_list is None:            # 拉之前面板已经被关掉了
@@ -4385,6 +5149,7 @@ class MainWindow(QWidget):
             self._close_picker()      # 上次没收干净（比如直接收起了浮层），先收拾掉再开
         self._hide_info_panel()       # 公告 / 更新那页开着就先收掉，别叠在一起
         self._pick_mode = 'file'
+        self._borrow_keyboard(not self.in_game())   # 桌面上让窗口能接收键盘，搜索框才打得进去
         panel = QWidget(self.pick_panel)
         box = QVBoxLayout(panel)
         box.setContentsMargins(0, 0, 0, 0)
@@ -4413,6 +5178,7 @@ class MainWindow(QWidget):
         self.pick_list = QListWidget()
         self.pick_list.itemDoubleClicked.connect(self._pick_open)
         self.pick_list.currentItemChanged.connect(self._sync_pick_open)
+        self._add_search_row(box, self.pick_list, '搜索这个文件夹里的文件（命中的会高亮）')
         box.addWidget(self.pick_list, 1)
 
         foot = QHBoxLayout()
@@ -4442,6 +5208,7 @@ class MainWindow(QWidget):
         """进到某个文件夹，先列子文件夹，再列 MIDI 文件。"""
         if self._choosing is None or self._pick_mode != 'file':
             return
+        self._pick_hint_saved = False          # 换了文件夹，搜索栏那句「命中 N 个」重新算
         folder = os.path.abspath(folder)
         if not os.path.isdir(folder):
             folder = os.path.dirname(folder)
@@ -4490,6 +5257,8 @@ class MainWindow(QWidget):
         else:
             self.pick_hint.setText('双击文件夹进去；MIDI 直接读，蓝色的音频会先转成单音 MIDI。'
                                    '上面「内置曲库」「已下载」能一键跳到自带的曲库和联网曲库下好的曲子')
+        if getattr(self, '_pick_search_apply', None) is not None:
+            self._pick_search_apply()          # 搜索框里还留着字就照着再筛一遍
 
     def _pick_open(self, item):
         """双击：文件夹就进去，文件就开始读。"""
@@ -4587,6 +5356,7 @@ class MainWindow(QWidget):
         self.pick_ok = None
         self.pick_status = None
         self._pick_mode = 'file'
+        self._borrow_keyboard(False)      # 把键盘还回浮层（不抢焦点、仍然置顶）
         self.pick_panel.setVisible(False)
         # 按用户的设置还原（默认是关着的）—— 别一收面板就把控制台顶出来
         self.log_view.setVisible(getattr(self, '_log_visible', LOG_VISIBLE_DEFAULT))
@@ -4700,9 +5470,119 @@ class MainWindow(QWidget):
             analysis.tonic, len(events), os.path.basename(score_path)))
         return True
 
+    # ---------- 拖文件进窗口：导入本地曲库 / 自动转谱 ----------
+
+    def eventFilter(self, obj, event):
+        """
+        把 midi / 音频拖进窗口就算导入（松手才动手）。
+
+        拖拽事件会先落到鼠标底下那个子控件（列表、输入框…）上，所以挂一个应用级
+        过滤器统一接住 —— 只认「属于本窗口、拖的又是本地文件」的那种，别管别的窗口。
+        """
+        kind = event.type()
+        if kind in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop):
+            try:
+                inside = isinstance(obj, QWidget) and obj.window() is self
+                if inside and self._drop_urls(event):
+                    if kind == QEvent.Type.Drop:
+                        event.acceptProposedAction()
+                        self._import_dropped(
+                            [url.toLocalFile() for url in self._drop_urls(event)])
+                        return True
+                    event.acceptProposedAction()
+                    return True
+            except Exception as exc:
+                log_event('拖拽事件处理出错：%s' % exc)
+        return super().eventFilter(obj, event)
+
+    @staticmethod
+    def _drop_urls(event):
+        """这次拖拽里的本地文件（不是本地文件的丢掉）。"""
+        mime = event.mimeData()
+        if mime is None or not mime.hasUrls():
+            return []
+        return [url for url in mime.urls() if url.isLocalFile()]
+
+    @staticmethod
+    def _unique_path(path):
+        """目标文件重名就加序号，绝不覆盖用户已有的曲子。"""
+        if not os.path.exists(path):
+            return path
+        base, ext = os.path.splitext(path)
+        for index in range(1, 1000):
+            candidate = '%s (%d)%s' % (base, index, ext)
+            if not os.path.exists(candidate):
+                return candidate
+        return path
+
+    def _import_dropped(self, paths):
+        """
+        松手之后：midi 复制进本地曲库；音频自动开转（转出来的 midi 也放曲库）；
+        认不出的格式说一声。
+        """
+        folder = library.downloaded_root()
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            pass
+        files = [path for path in (paths or []) if os.path.isfile(path)]
+        if not files:
+            self.log('拖进来的不是文件（文件夹 / 网页链接之类）；拖 midi、mp3 这类文件才行')
+            return
+        midis, audios, others = [], [], []
+        for path in files:
+            low = path.lower()
+            if low.endswith(MIDI_SUFFIX):
+                midis.append(path)
+            elif low.endswith(AUDIO_SUFFIX):
+                audios.append(path)
+            else:
+                others.append(path)
+        moved = 0
+        for path in midis:
+            dest = self._unique_path(os.path.join(folder, os.path.basename(path)))
+            try:
+                shutil.copy2(path, dest)
+                moved += 1
+                self.log('拖进来的 midi 已放进曲库：%s' % dest)
+            except Exception as exc:
+                self.log('复制失败（%s）：%s' % (os.path.basename(path), exc))
+        if audios and (audio2midi is None or not edition.has_audio()):
+            self.log('拖进来 %d 个音频，但这一版没带「音频转 MIDI」（精简版不含转谱）'
+                     % len(audios))
+            audios = []
+        for path in audios:
+            base = os.path.splitext(os.path.basename(path))[0] + '.mid'
+            self._audio_queue.append((path, self._unique_path(os.path.join(folder, base))))
+        if others:
+            self.log('这些文件不认识，跳过了：%s'
+                     % '、'.join(os.path.basename(path) for path in others[:5]))
+        if moved:
+            self.set_status('已导入 %d 首' % moved, 'ready')
+            self._refresh_downloaded()
+        if self._audio_queue and not self._converting:
+            self._convert_next_queued()
+
+    def _refresh_downloaded(self):
+        """「曲库 -> 已下载」列表正开着的话刷一下，刚导入的才看得到。"""
+        try:
+            if self.pick_list is not None and self._pick_dir == library.downloaded_root():
+                self._pick_enter(self._pick_dir)
+        except Exception:
+            pass
+
+    def _convert_next_queued(self):
+        """一次拖进来好几段音频：排队一段一段转（convert_audio 一次只干一个）。"""
+        if self._converting or not self._audio_queue:
+            return
+        path, out = self._audio_queue.pop(0)
+        self.log('开始转换拖进来的音频：%s' % os.path.basename(path))
+        if not self.convert_audio(path, out=out):
+            self._convert_next_queued()
+
     # ---------- 音频转 MIDI ----------
 
-    def convert_audio(self, path):
+    def convert_audio(self, path, out=None):
         """
         音频 -> 单音 MIDI（后台线程，转完自动接着读）。
 
@@ -4711,6 +5591,8 @@ class MainWindow(QWidget):
 
         同音重复切多细由界面上那个滑块（self._repeat_level）决定；顺手记下音频路径，
         好让「应用」按钮之后拿它重转。
+
+        out 是转出来的 midi 存哪儿（拖进来的音频要放进曲库）；None = 跟音频同目录。
         """
         if self._converting:
             self.log('上一段音频还在转，稍等一下')
@@ -4722,6 +5604,10 @@ class MainWindow(QWidget):
             self.log('正在演奏中，先按 F8 停止')
             return False
         self._converting = True
+        if out is not None:
+            self._audio_out = out
+        elif path != getattr(self, '_audio_source', None):
+            self._audio_out = None           # 新选的音频：默认跟音频放一起
         self._audio_source = path            # 「应用」以后拿它重转
         self.btn_audio.setEnabled(False)
         if self.repeat_apply is not None:
@@ -4742,7 +5628,7 @@ class MainWindow(QWidget):
                                          '，'.join('%s=%s' % item
                                                    for item in sorted(extra.items()))))
                 out = audio2midi.convert(
-                    path, backend='auto',
+                    path, out=self._audio_out, backend='auto',
                     progress=lambda text: self.message.emit(text), **extra)
             except Exception as exc:
                 self.audio_done.emit('', str(exc))
@@ -4769,12 +5655,14 @@ class MainWindow(QWidget):
                          '安装见 mp3midi/README.md，国内用清华镜像：'
                          'pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --no-deps basic-pitch')
             self.set_status('转换失败', 'error')
+            self._convert_next_queued()
             return
         if not self.isVisible():
             self.show_window(in_game=self.in_game())
         self.log('音频转好了：%s' % os.path.basename(midi_path))
         self.load(midi_path)
         self.log('按「♪ 试听」听听主旋律抓对没有；不对就换个后端，或者先把人声 / 主旋律分离出来再转')
+        self._convert_next_queued()
 
     # ---------- 试听 ----------
 
@@ -4802,26 +5690,54 @@ class MainWindow(QWidget):
         self._previewing = True
         self._preview_path = None
         self._preview_base = 0.0
+        self._preview_seek = 0.0
         self._preview_total = preview.total_seconds(events)
         self._set_preview_button(True)
         self.preview_slider.setEnabled(False)      # 合成完才让拨
         self._set_preview_position(0.0)
-        self.set_status('试听准备中', 'play')
-        self.log('试听：%s（%d 个音，约 %s）'
-                 % (os.path.basename(self.score_path or ''), len(events),
-                    preview.format_time(self._preview_total)))
+        self.log('试听：%s（%d 个音，%s× 速度）'
+                 % (os.path.basename(self.score_path or ''), len(events), self._speed()))
         log_event('试听：%s' % os.path.basename(self.score_path or ''))
-        threading.Thread(target=self._render_preview,
-                         args=(events, self.analysis.tonic), daemon=True).start()
+        self._start_preview_render()
 
-    def _render_preview(self, events, tonic):
-        """后台线程：合成整首，合成完用 preview_ready 信号回到主线程再播。"""
+    def _start_preview_render(self, seek=None):
+        """
+        按当前倍速把谱面缩放一遍，交给后台线程合成。
+
+        速度跟演奏用的是同一套换算（player.Player.speed_up：起点和时值一起乘 1/速度），
+        所以试听听到的快慢跟真正演奏出来的一致。
+
+        seek 是合成完从第几秒开始放（换速度重合成时接着放）；不传就沿用上一次记下的。
+        """
+        if not self._previewing or self.analysis is None:
+            return
+        if seek is not None:
+            self._preview_seek = max(float(seek), 0.0)
+        self._preview_speed = self._speed()
+        events = player.Player.speed_up(list(self.score_events), self._preview_speed)
+        self._preview_total = preview.total_seconds(events)
+        self.preview_slider.setEnabled(False)
+        self.set_status('试听准备中', 'play')
+        self._preview_token = getattr(self, '_preview_token', 0) + 1
+        threading.Thread(target=self._render_preview,
+                         args=(events, self.analysis.tonic, self._preview_token),
+                         daemon=True).start()
+
+    def _render_preview(self, events, tonic, token=0):
+        """
+        后台线程：合成整首，合成完用 preview_ready 信号回到主线程再播。
+
+        token 是这次的合成序号：合成期间用户又换了速度（重开了一次合成）的话，这一份
+        已经作废，结果直接丢掉 —— 不然两次合成回来的顺序一乱，放的会是旧速度那份。
+        """
         try:
             self.previewer.render(events, tonic)
         except Exception as exc:
-            self.preview_ready.emit(str(exc))
+            if token == getattr(self, '_preview_token', 0):
+                self.preview_ready.emit(str(exc))
             return
-        self.preview_ready.emit('')
+        if token == getattr(self, '_preview_token', 0):
+            self.preview_ready.emit('')
 
     def _on_preview_ready(self, error):
         """合成完了：从头放出来。合成期间已经被停掉的话就什么都不做。"""
@@ -4833,11 +5749,42 @@ class MainWindow(QWidget):
             return
         self._preview_total = self.previewer.total
         self.preview_slider.setEnabled(True)
-        if not self._start_preview_at(0.0):
+        if not self._start_preview_at(max(getattr(self, '_preview_seek', 0.0), 0.0)):
             self.log('试听播放不了（音频可能是空的）')
             self.stop_preview()
             return
         self._preview_tick()
+
+    def on_speed_changed(self, _text=None):
+        """
+        界面上换了倍速：试听也跟着换（演奏是开始的时侯读速度；试听是合成好的音频，
+        不重合成还是老速度）。
+
+        正在听的话从**同一个乐句位置**接着放：旧时间轴位置 -> 谱面原速 -> 新时间轴。
+        """
+        if not getattr(self, '_previewing', False) or self.analysis is None:
+            return
+        old = float(getattr(self, '_preview_speed', 1.0) or 1.0)
+        new = self._speed()
+        if abs(new - old) < 1e-9:
+            return
+        elapsed = 0.0
+        if self._preview_t0 is not None:
+            elapsed = self._preview_base + (time.time() - self._preview_t0)
+        position = elapsed * old / new
+        try:                               # 先把这一段停了，免得新旧两份声音叠在一起
+            self.previewer.stop()
+        except Exception:
+            pass
+        try:
+            self.preview_timer.stop()
+        except Exception:
+            pass
+        self._preview_t0 = None
+        self._preview_path = None
+        self.log('试听跟着换速度：%s×，从 %s 接着放'
+                 % (new, preview.format_time(position)))
+        self._start_preview_render(seek=position)
 
     def _start_preview_at(self, seconds):
         """
@@ -4904,6 +5851,7 @@ class MainWindow(QWidget):
         self._previewing = False
         self._preview_t0 = None
         self._preview_base = 0.0
+        self._preview_token = getattr(self, '_preview_token', 0) + 1   # 还在合成的作废
         try:
             self.preview_timer.stop()
         except Exception:
@@ -5386,6 +6334,8 @@ class MainWindow(QWidget):
 
 def main(argv):
     sys.excepthook = lambda kind, value, tb: log_crash(''.join(traceback.format_exception(kind, value, tb)))
+    errorreport.set_app_info(APP_VERSION, edition.LITE, app_dir())
+    threading.excepthook = _thread_excepthook     # 后台线程崩了也记日志 + 上报
 
     # 万一发生的是「原生崩溃」（不是 Python 异常），也能在日志里留下当时的 Python 调用栈
     try:
@@ -5400,6 +6350,12 @@ def main(argv):
         if relaunch_as_admin():
             return 0
         log_crash('提权被拒绝（UAC）')
+    if is_admin():
+        # 提了权就收不到资源管理器拖过来的文件（Windows 的完整性级别拦的，见
+        # allow_lower_privilege_drop）：先记一笔，用户问「拖拽没反应」时有据可查。
+        log_event('以管理员身份运行：Windows 会拦住从资源管理器拖进来的文件'
+                  '（拖拽光标是个禁止的圆圈）。要拖拽就：① 把文件拖进「打开本地曲库文件夹」'
+                  '打开的那个文件夹，或 ② 用普通权限启动本程序。')
 
     initial = None
     for arg in argv:
