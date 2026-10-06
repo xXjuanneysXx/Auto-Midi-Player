@@ -967,6 +967,28 @@ def read_text_file(site, owner, repo, path, token='', branch='', timeout=API_TIM
     return '', why or ('读不到 %s' % path)
 
 
+def read_file_optional(site, owner, repo, path, token='', branch='', timeout=API_TIMEOUT):
+    """
+    读一个**可能还不存在**的文本文件：(正文, 存不存在, 出错信息)。
+
+    跟 read_text_file 的区别：文件不存在不算错（404 / Gitee 的空目录都算「没有」），
+    只有真连不上、接口报错才给出错信息 —— 音游成绩那份「曲目索引.json」要靠这个
+    区分「这首歌没人传过」和「网络不通」。
+    """
+    url = _contents_url(site, owner, repo, path, branch)
+    data, code, why = _api_raw(url, token, timeout=timeout, site=site)
+    if isinstance(data, dict) and data.get('content'):
+        try:
+            return base64.b64decode(data['content']).decode('utf-8', 'replace'), True, ''
+        except Exception as exc:
+            return '', True, '内容解不开：%s' % exc
+    if code == 404:
+        return '', False, ''
+    if isinstance(data, list):
+        return '', False, ''
+    return '', False, why or ('读不到 %s' % path)
+
+
 def is_midi(path):
     """这个文件名像不像曲子。"""
     return str(path).lower().endswith(MIDI_SUFFIX)

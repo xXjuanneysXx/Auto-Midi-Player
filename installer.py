@@ -76,7 +76,7 @@ import fileassoc                          # .mproj 文件关联（跟主程序�
 
 APP_NAME = 'AutoPlay'
 APP_TITLE = 'MIDI 简谱自动演奏'
-APP_VERSION = '1.1.0'
+APP_VERSION = '1.1.1'
 APP_EXE = 'AutoPlay.exe'
 UNINSTALL_EXE = 'uninstall.exe'       # 打包时放进 payload，装完在安装目录根上
 UNINSTALL_JSON = 'uninstall.json'     # 安装时写，告诉上面那个 exe 该怎么卸

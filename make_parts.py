@@ -37,7 +37,19 @@ CHUNK_DIR = os.path.join(HERE, '发布', '分片')
 MANIFEST_NAME = 'payload.json'
 
 # 版本 / 两个 payload 在哪儿 / 附件地址的模板
-DEFAULT_VERSION = '1.1.0'
+def _app_version(fallback='1.1.0'):
+    """程序版本号直接从 installer.py 里读 —— 省得两处手改忘了对上。"""
+    try:
+        with open(os.path.join(HERE, 'installer.py'), encoding='utf-8') as handle:
+            for line in handle:
+                if line.startswith('APP_VERSION'):
+                    return line.split('=', 1)[1].strip().strip('\'"')
+    except OSError:
+        pass
+    return fallback
+
+
+DEFAULT_VERSION = _app_version()
 DEFAULT_CHUNK_MB = 32
 GITEE_RELEASE = 'https://gitee.com/juanneys/midi-music/releases/download/v%s'
 

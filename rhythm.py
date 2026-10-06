@@ -8,10 +8,12 @@ r"""
 
 判定
 ----
-* 音符头到判定线，在 [开始 - 0.25 秒, 开始 + 0.15 秒] 之间按下对应琴键就算「按到」；
-* 按住时长对不对：|按住时长 - 音长| / 音长，≤10% 是 perfect，≤30% 是 good，
-  再离谱是「按到了但不够准」（plain：**给分，只是比 good 少**，不加连击，显示上叫 MISS）；
-* 越过判定线 150 毫秒还没按，**或者下一个音已经开始弹了**，算漏按（miss）；
+* 音符头到判定线，在 [开始 - 0.25 秒, 开始 + 0.40 秒] 之间按下对应琴键就算「按到」；
+* 按住时长对不对：**相对误差**（|按住时长 - 音长| / 音长）≤10% 或**绝对误差** ≤90 毫秒
+  是 perfect，≤30% 或 ≤200 毫秒是 good，再离谱是「按到了但不够准」
+  （plain：**给分，只是比 good 少**，不加连击，显示上叫 MISS）；
+  两个尺度取宽的那个 —— 快歌的音只有几十毫秒，光按百分比算没人做得到；
+* 越过判定线 400 毫秒还没按，**或者下一个音已经开始弹了**，算漏按（miss）；
 * 按了琴键但升降调 / 半音（鼠标键）不对，算按错键（wrong）。
   miss 和 wrong 都「算错」，但分开记、分开显示。
 
@@ -57,7 +59,11 @@ RESULTS = (PERFECT, GOOD, PLAIN, WRONG, MISS)
 
 HOLD_PERFECT = 0.10    # 按住时长相对误差 ≤10% -> perfect
 HOLD_GOOD = 0.30       # ≤30% -> good
-LATE_LIMIT = 0.15      # 过了判定线这么久还没按 -> miss
+# 绝对宽容（v1.1.1 加）：快歌的音只有几十 ~ 一百多毫秒，光按百分比算要求几毫秒 ——
+# 人根本做不到。所以**相对误差**和**绝对误差**取宽的那个：满足任意一条就算这一档。
+HOLD_PERFECT_MIN = 0.09    # 误差 ≤ 90 毫秒，一律 perfect
+HOLD_GOOD_MIN = 0.20       # 误差 ≤ 200 毫秒，一律 good
+LATE_LIMIT = 0.40      # 过了判定线这么久还没按 -> miss（v1.1.1 起从 0.15 放宽到 0.40）
 EARLY_WINDOW = 0.25    # 抢拍这么早以内也算按到（和练习模式那个判定窗一致）
 
 BASE_SCORE = {PERFECT: 100, GOOD: 60, PLAIN: 30, WRONG: 0, MISS: 0}
@@ -74,9 +80,18 @@ ONLINE_KEEP = 200          # 拉回来之后最多留多少条
 NET_TIMEOUT = 8.0          # 单个请求最多等几秒
 NET_DEADLINE = 12.0        # 整趟「列目录 + 读文件」加起来最多等几秒
 
+# 线上榜单**只在 Gitee**（用户要求）：GitHub 那边国内经常拉不到，成绩数据不放那儿。
+SITE_ONLY = library.SITE_GITEE
+
 DEFAULT_REPO = {'site': library.SITE_GITEE, 'owner': 'juanneys', 'repo': 'midi-music',
                 'branch': 'master', 'dir': library.RHYTHM_DIR}
 CONFIG_NAME = 'rhythm.json'      # 仓库根目录那份（可选）：换仓库 / 目录不用重新打包
+CONFIG_CACHE = 'rhythm_remote.json'   # 拉回来的那份存在 %LOCALAPPDATA%\AutoPlay\ 下
+# 「哪些曲子有人传过成绩」的总目录（放在音游记录下面）。
+# 有它在，就能分清「一首歌没人传过」和「网线不通」—— 前者去列目录会被 Gitee 报错，
+# 用户看到的就成了「没读到联网成绩」，其实只是这首歌还没人传。
+MAP_NAME = '曲目索引.json'
+FORMAT_MAP = 'autoplay-rhythm-songs'
 
 
 # ---------- 纯计算 ----------
@@ -87,12 +102,23 @@ def relative_error(hold, dur):
     return abs(float(hold) - dur) / dur
 
 
+def hold_error(hold, dur):
+    """按住时长和音长的差（秒，绝对值）。"""
+    return abs(float(hold or 0.0) - float(dur or 0.0))
+
+
 def grade(hold, dur):
-    """按住这么久算哪一档。"""
-    error = relative_error(hold, dur)
-    if error <= HOLD_PERFECT:
+    """
+    按住这么久算哪一档。
+
+    相对误差（≤10% / ≤30%）和绝对误差（≤90 / ≤200 毫秒）**取宽的那个**：
+    「提前按了一点、也提前松了」按住时长就短，百分比一看差得离谱，
+    实际也就差几十毫秒 —— 这种该算按对，别因为音短就判成没按。
+    """
+    diff = hold_error(hold, dur)
+    if diff <= HOLD_PERFECT_MIN or diff <= max(float(dur or 0.0), 0.001) * HOLD_PERFECT:
         return PERFECT
-    if error <= HOLD_GOOD:
+    if diff <= HOLD_GOOD_MIN or diff <= max(float(dur or 0.0), 0.001) * HOLD_GOOD:
         return GOOD
     return PLAIN
 
@@ -269,6 +295,24 @@ class Session(object):
                 'stars': stars(total, counts),
                 'rainbow': rainbow(total, counts, self.max_combo)}
 
+    def abandon(self):
+        """
+        中途停下：把**还没判过的音**全算漏按。
+
+        不然半截成绩会虚高 —— 弹了两个音就退出，只算那两个音的分，
+        星级还能五颗。没弹到的一律 miss，分数才作数。
+        """
+        out = []
+        for index, note in enumerate(self.notes):
+            if self.judged[index]:
+                continue
+            self.judged[index] = True
+            self._score(MISS)
+            out.append((MISS, note))
+        self.open.clear()
+        self.cursor = len(self.notes)
+        return out
+
 
 # ---------- 成绩记录（本机） ----------
 
@@ -394,12 +438,110 @@ def repo_config(remote=None):
             value = remote.get(key)
             if isinstance(value, str) and value.strip():
                 out[key] = value.strip()
+    out['site'] = SITE_ONLY          # 线上排名只在 Gitee：别让配置把它指到 GitHub 去
     return out
 
 
 def remote_dir(song, folder=None):
     """这首歌在仓库里的目录。"""
     return '%s/%s' % (str(folder or DEFAULT_REPO['dir']).strip('/'), _safe(song))
+
+
+def map_path(cfg=None):
+    """「哪些曲子有成绩」那份总目录在仓库里的路径。"""
+    cfg = cfg or repo_config()
+    return '%s/%s' % (str(cfg.get('dir') or DEFAULT_REPO['dir']).strip('/'), MAP_NAME)
+
+
+def _has_song(mapping, song):
+    """表里有没有这首歌（大小写不敏感）。"""
+    key = str(song or '').strip().lower()
+    if not key:
+        return False
+    for name in mapping or {}:
+        if str(name).strip().lower() == key:
+            return True
+    return False
+
+
+def score_map(remote=None, timeout=NET_TIMEOUT):
+    """
+    读仓库里那份「哪些曲子有人传过成绩」的总目录：({曲名: {...}} 或 None, 出错信息)。
+
+    * 读到了 → (表, '')；表里没有这首 = **这首歌根本没人传过**，不是网络问题；
+    * 索引文件还不存在（第一次用 / 仓库刚建）→ ({}, '')，也当「都没传过」；
+    * 真读不到（连不上 / 接口报错）→ (None, 说明)，这才该说「请检查网络连接」。
+    """
+    cfg = repo_config(remote)
+    try:
+        token = str(library.get_token(cfg['site']) or '')
+    except Exception:
+        token = ''
+    text, exists, why = library.read_file_optional(
+        cfg['site'], cfg['owner'], cfg['repo'], map_path(cfg), token,
+        branch=cfg['branch'], timeout=timeout)
+    if why:
+        return None, why
+    if not exists or not text:
+        return {}, ''
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}, ''
+    songs = data.get('songs') if isinstance(data, dict) else None
+    if not isinstance(songs, dict):
+        return {}, ''
+    return dict((str(name), info) for name, info in songs.items()), ''
+
+
+def bump_score_map(song, entry, remote=None, timeout=NET_TIMEOUT):
+    """
+    传完成绩，顺手把总目录更新一下（这首歌传了几次、最高多少分）。
+
+    **尽力而为**：撞车 / 网差更新不了就算了 —— 那份目录只是让界面能分清
+    「没人传过」和「网线不通」，成绩本身还是那条 json（`fetch` 以目录为准，
+    目录里漏了也只会让这首歌显示成「还没人传过」，不会把已有的成绩弄丢）。
+    """
+    cfg = repo_config(remote)
+    try:
+        token = str(library.get_token(cfg['site']) or '')
+    except Exception:
+        token = ''
+    if not token:
+        return False
+    path = map_path(cfg)
+    try:
+        sha, why = library.remote_sha(cfg['site'], cfg['owner'], cfg['repo'], path,
+                                      token=token, ref=cfg['branch'])
+        if why:
+            return False
+        text = ''
+        if sha:
+            text, _why = library.read_text_file(cfg['site'], cfg['owner'], cfg['repo'], path,
+                                                token, branch=cfg['branch'], timeout=timeout)
+        try:
+            data = json.loads(text) if text else {}
+        except ValueError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        songs = data.get('songs')
+        if not isinstance(songs, dict):
+            songs = {}
+        info = dict(songs.get(str(song)) or {}) if isinstance(songs.get(str(song)), dict) else {}
+        info['count'] = int(info.get('count') or 0) + 1
+        info['time'] = str(entry.get('time') or info.get('time') or '')
+        info['best'] = max(int(info.get('best') or 0), int(entry.get('score') or 0))
+        songs[str(song)] = info
+        body = json.dumps({'format': FORMAT_MAP, 'songs': songs},
+                          ensure_ascii=False, indent=2, sort_keys=True).encode('utf-8')
+        _url, why2 = library.put_file(cfg['site'], cfg['owner'], cfg['repo'], path, body,
+                                      token, branch=cfg['branch'], sha=sha,
+                                      message='AutoPlay 音游曲目索引：%s' % song,
+                                      timeout=timeout)
+        return not why2
+    except Exception:
+        return False
 
 
 def in_library(song, timeout=None):
@@ -442,11 +584,15 @@ def upload(song, entry, remote=None, timeout=NET_TIMEOUT):
     name = '%s-%04d.json' % (time.strftime('%Y%m%d-%H%M%S'), random.randint(0, 9999))
     path = '%s/%s' % (remote_dir(song, cfg['dir']), name)
     body = json.dumps(entry, ensure_ascii=False, indent=2).encode('utf-8')
-    return library.put_file(cfg['site'], cfg['owner'], cfg['repo'], path, body, token,
-                            branch=cfg['branch'],
-                            message='AutoPlay 音游成绩 %s %s 分'
-                                    % (song, entry.get('score')),
-                            timeout=timeout)
+    url, why = library.put_file(cfg['site'], cfg['owner'], cfg['repo'], path, body, token,
+                                branch=cfg['branch'],
+                                message='AutoPlay 音游成绩 %s %s 分'
+                                        % (song, entry.get('score')),
+                                timeout=timeout)
+    if why:
+        return url, why
+    bump_score_map(song, entry, remote, timeout=timeout)   # 总目录：尽力而为，失败不影响成绩
+    return url, ''
 
 
 def fetch(song, remote=None, timeout=NET_TIMEOUT, limit=ONLINE_FETCH_LIMIT):
@@ -465,9 +611,16 @@ def fetch(song, remote=None, timeout=NET_TIMEOUT, limit=ONLINE_FETCH_LIMIT):
     files, why = library.list_dir(cfg['site'], cfg['owner'], cfg['repo'], folder,
                                   token=token, branch=cfg['branch'], timeout=timeout)
     if why:
+        # 列目录失败：可能真连不上，也可能只是**这首歌还没人传过**（Gitee 对不存在的
+        # 目录也会报错）。看一眼总目录就知道是哪种 —— 目录里没有这首 = 没人传过。
+        known, why_map = score_map(remote, timeout=timeout)
+        if known is not None and not _has_song(known, song):
+            return [], ''
         return [], why
     if not files:
         return [], ''
+    files = [item for item in files
+             if os.path.basename(str(item.get('path') or '')) != MAP_NAME]
     files.sort(key=lambda item: item.get('path') or '', reverse=True)
     out = []
     last = ''

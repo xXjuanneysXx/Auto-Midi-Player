@@ -662,16 +662,19 @@ class FollowWindow(QWidget):
         if color is not None and note is not None:
             self._flash[getattr(note, 'lane', 0)] = (now + 0.22, color)
 
-    def _finish_rhythm(self):
-        """整首走完：把还按着的结掉，算结算。"""
+    def _finish_rhythm(self, reason='done'):
+        """把这一把结掉、算结算：整首走完（done）或者中途停下（stop）。"""
         if self.mode != 'rhythm' or self.session is None or self._rhythm_done:
             return
         self._rhythm_done = True               # 先立旗子：后面 on_result 里发生什么都只算一次
         for lane in list(self.session.open):
             self.session.release(lane, self._t)
         self.session.tick(self._t + 0.001)
+        if reason != 'done':
+            self.session.abandon()             # 半截成绩：没弹到的全算漏按，不然分数虚高
         self._armed.clear()
         self._result = self.session.summary()
+        self._result['partial'] = (reason != 'done')
         self.state = 'done'
         self.update()
         if callable(self.on_result):
@@ -679,7 +682,18 @@ class FollowWindow(QWidget):
                 self.on_result(dict(self._result))
             except Exception:
                 pass
-        self._fire_finish('done')
+        self._fire_finish(reason)
+
+    def stop_rhythm(self):
+        """
+        音游中途停下（F8 / 卡住动不了）：照样把这一把结掉、给一份结算。
+
+        用户要求：只有整首弹完才能结算的话，卡住 / 中途停下就什么也存不了、
+        也传不了 —— 现在中途停下也能存本机、也能传（成绩标成「中途」）。
+        """
+        if self.mode != 'rhythm':
+            return
+        self._finish_rhythm('stop')
 
     def _read_keys(self):
         """哪几个键现在被按住（程序用 SendInput 弹的也算，按键状态一样会变）。"""
@@ -693,13 +707,17 @@ class FollowWindow(QWidget):
         return self.LEGEND_H + self.HEADER_H
 
     def _keys_top(self):
-        # 鼠标指示那条只在练习模式显示，窗口高度也跟着收 / 放，别在下面空一截
+        # 鼠标指示那条不是每个模式都显示，窗口高度也跟着收 / 放，别在下面空一截
         extra = (self.MOUSE_H + 6) if self._mouse_row() else 6
         return self.height() - self.KEYS_H - extra
 
     def _mouse_row(self):
-        """琴键下面那条「左 降调 / 中 升半音 / 右 升调」只在练习模式显示。"""
-        return self.mode == 'practice'
+        """琴键下面那条「左 降调 / 中 升半音 / 右 升调」显示不显示。
+
+        练习、音游、原速跟奏都显示 —— 这条是**鼠标实时状态**：现在按着哪几个键，
+        哪一块就亮起来（v1.1.1 起不再只在练习模式显示）。
+        """
+        return self.mode in ('practice', 'rhythm', 'follow')
 
     def _fit_row(self):
         """按要不要显示鼠标指示条，把窗口高度收 / 放一下。"""
@@ -757,20 +775,24 @@ class FollowWindow(QWidget):
         for lane in range(1, len(self.KEYS)):
             x = self._lane_x(lane)
             painter.drawLine(int(x), self._content_top(), int(x), int(self._hit_line()))
-        # 练习模式：把「现在该弹的那一列」的底色铺成**你现在按着的鼠标组合**的颜色
-        # （颜色表跟长条同一套）—— 一眼看出自己到底按了升调 / 升半音没有：
-        # 该按的记号在长条上写着，按没按对看这一列的背景色。
+        # 把「现在该弹的那一列」的底色铺成**你现在正按着的鼠标组合**的颜色
+        # （颜色表跟长条同一套）—— 这是鼠标实时状态：一眼看出自己到底按了升调 / 升半音没有。
+        # 练习模式看的是「停在那儿等你的那个音」，音游模式看的是「下一个还没判的音」。
         if self.paced and self.notes and self._wait_index < len(self.notes):
             target = self.notes[self._wait_index]
-            if self._mouse in NOTE_COLORS and self._mouse:
-                tone = QColor(NOTE_COLORS[self._mouse][1])
-                rect = self._lane_rect(target.lane).adjusted(2, 0, -2, 0)
-                gradient = QLinearGradient(0, rect.top(), 0, rect.bottom())
-                gradient.setColorAt(0.0, QColor(tone.red(), tone.green(), tone.blue(), 22))
-                gradient.setColorAt(1.0, QColor(tone.red(), tone.green(), tone.blue(), 92))
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(gradient))
-                painter.drawRoundedRect(rect, 9, 9)
+        elif self.mode == 'rhythm' and self.session is not None:
+            target = self.session.pending()
+        else:
+            target = None
+        if target is not None and self._mouse in NOTE_COLORS and self._mouse:
+            tone = QColor(NOTE_COLORS[self._mouse][1])
+            rect = self._lane_rect(target.lane).adjusted(2, 0, -2, 0)
+            gradient = QLinearGradient(0, rect.top(), 0, rect.bottom())
+            gradient.setColorAt(0.0, QColor(tone.red(), tone.green(), tone.blue(), 22))
+            gradient.setColorAt(1.0, QColor(tone.red(), tone.green(), tone.blue(), 92))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(gradient))
+            painter.drawRoundedRect(rect, 9, 9)
         # 被按住 / 刚按对按错的列：整列透出一层它自己的颜色，越靠近判定框越亮
         for lane in range(len(self.KEYS)):
             color = self._active_color(lane)

@@ -37,8 +37,8 @@ try:                                                  # 优先 Qt 官方绑定
                                QKeySequence, QPainter, QPalette, QPen, QPixmap, QShortcut)
     from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
                                    QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-                                   QListWidget, QListWidgetItem, QMenu, QProgressBar,
-                                   QPushButton, QSlider,
+                                   QListWidget, QListWidgetItem, QMenu, QMessageBox,
+                                   QProgressBar, QPushButton, QSlider,
                                    QScrollArea, QSizePolicy, QSpinBox, QSystemTrayIcon,
                                    QStyle, QStyledItemDelegate, QStyleOptionViewItem,
                                    QTabWidget, QTextEdit, QVBoxLayout, QWidget)
@@ -49,8 +49,8 @@ except ImportError:                                   # 装了 PyQt6 也行
                              QKeySequence, QPainter, QPalette, QPen, QPixmap, QShortcut)
     from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
                                  QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-                                 QListWidget, QListWidgetItem, QMenu, QProgressBar,
-                                 QPushButton, QSlider,
+                                 QListWidget, QListWidgetItem, QMenu, QMessageBox,
+                                 QProgressBar, QPushButton, QSlider,
                                  QScrollArea, QSizePolicy, QSpinBox, QSystemTrayIcon,
                                  QStyle, QStyledItemDelegate, QStyleOptionViewItem,
                                  QTabWidget, QTextEdit, QVBoxLayout, QWidget)
@@ -95,7 +95,7 @@ if not edition.has_recorder():
                                     if a != 'record')
 
 APP_TITLE = 'MIDI 简谱自动演奏' + ('（精简版）' if edition.LITE else '')
-APP_VERSION = '1.1.0'
+APP_VERSION = '1.1.1'
 MIDI_FILTER = 'MIDI 文件 (*.mid *.midi *.kar *.rmi);;所有文件 (*.*)'
 # 覆盖模式下不用系统文件框，自己列目录，靠这个认出 MIDI 文件
 MIDI_SUFFIX = ('.mid', '.midi', '.kar', '.rmi')
@@ -472,6 +472,7 @@ def log_event(text):
 BASE_WINDOW_W = 780
 BASE_WINDOW_H = 700
 PICKER_H = 840                 # 「曲库 / 选文件」那一页撑到多高
+SCREEN_MARGIN = 40             # 窗口（尤其撑高后）离屏幕边缘至少留这么多
 
 
 def window_size_for(screen_w, screen_h):
@@ -1686,6 +1687,7 @@ class RhythmResultWindow(QWidget):
     """
 
     uploaded = Signal(str, str)          # 上传完了：(网页地址或分数, 出错信息)
+    song_uploaded = Signal(object, str, str, str)  # 曲子 + 成绩传完了：(凭据, 曲子说明, 成绩地址, 出错信息)
     online_ready = Signal(object, str)   # 联网成绩拉回来了：(列表, 出错信息)
     library_ready = Signal(object, str)  # 「这首在不在联网曲库里」查完了：(True/False/None, 说明)
     name_saved = Signal(str)             # 存过 / 传过了，主窗口拿它记住名字
@@ -1700,13 +1702,19 @@ class RhythmResultWindow(QWidget):
         self.resize(430, 620)
         self.song = ''
         self.summary = {}
+        self.midi_path = ''                  # 这首曲子的本机 midi（本地曲子一键上榜时传的就是它）
+        self.song_title = ''
+        self.song_artist = ''
         self.online = []
         self._busy = False
+        self._publishing = False      # 正在「上传曲子 + 成绩」
+        self._publish_token = None    # 这一把上传的凭据（换了一首曲子旧结果就作废）
         self._online_busy = False     # 联网榜单正在读（挡重复请求，别一点再点）
         self.library = None           # 这首歌在不在联网曲库里：True / False / None（还没查）
         self.library_why = ''
         self._library_busy = False
         self.uploaded.connect(self._on_uploaded)
+        self.song_uploaded.connect(self._on_song_uploaded)
         self.online_ready.connect(self._on_online)
         self.library_ready.connect(self._on_library)
 
@@ -1771,6 +1779,17 @@ class RhythmResultWindow(QWidget):
             row.addWidget(button)
         box.addLayout(row)
 
+        # 本地自己转的曲子：一键把曲子公开传进曲库，传完顺手把成绩也传上去（v1.1.1）
+        self.song_btn = QPushButton('上传曲子 + 成绩')
+        self.song_btn.setObjectName('primary')
+        self.song_btn.setToolTip(
+            '本地自己转的曲子：把这首 midi 公开传到两套曲库（国内 + GitHub），\n'
+            '传完顺手把这次成绩也传上排行榜 —— 不用先传曲子再重弹一遍。')
+        self.song_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.song_btn.clicked.connect(self.upload_song_and_score)
+        self.song_btn.setVisible(False)
+        box.addWidget(self.song_btn)
+
         self.hint = QLabel('')
         self.hint.setObjectName('panelMeta')
         self.hint.setWordWrap(True)
@@ -1794,10 +1813,21 @@ class RhythmResultWindow(QWidget):
 
     # ---------- 内容 ----------
 
-    def show_result(self, song, summary, name=''):
-        """铺一遍这次的结果，顺手把本机 / 联网的排行榜拉出来。"""
+    def show_result(self, song, summary, midi_path=None, title='', artist=''):
+        """
+        铺一遍这次的结果，顺手把本机 / 联网的排行榜拉出来。
+
+        midi_path 是这首曲子的**本机 midi 文件**：「上传曲子 + 成绩」拿它把曲子传进曲库
+        （本地自己转的 mp3 也能一键上榜，不用先传曲子再重弹一遍）。
+        """
         self.song = str(song or '未知曲子')
         self.summary = dict(summary or {})
+        self.midi_path = str(midi_path or '')
+        self.song_title = str(title or '')
+        self.song_artist = str(artist or '')
+        # 上一把「上传曲子 + 成绩」要是还没回来，这把开始就别再认它的结果了
+        self._publish_token = None
+        self._publishing = False
         self.name_edit.clear()            # 名字不预填，每次自己写
         stars = int(self.summary.get('stars') or 0)
         rainbow = int(self.summary.get('rainbow') or 0)
@@ -1805,18 +1835,29 @@ class RhythmResultWindow(QWidget):
         self.score.setText('%d 分' % int(self.summary.get('score') or 0))
         self.song_label.setText(self.song)
         self.detail.setText(
-            'PERFECT %d ・ GOOD %d ・ MISS %d（差一点 %d）・ WRONG %d ・ 最大连击 %d'
+            ('中途停止 ・ ' if self.summary.get('partial') else '')
+            + 'PERFECT %d ・ GOOD %d ・ MISS %d（差一点 %d）・ WRONG %d ・ 最大连击 %d'
             % (int(self.summary.get('perfect') or 0), int(self.summary.get('good') or 0),
                int(self.summary.get('miss') or 0), int(self.summary.get('plain') or 0),
                int(self.summary.get('wrong') or 0), int(self.summary.get('max_combo') or 0)))
-        self.save_btn.setEnabled(True)
-        self.upload_btn.setEnabled(False)      # 确认在联网曲库里才放行（见 check_library）
         self.library = None
         self.library_why = ''
         self.library_hint.setText('正在确认这首歌在不在联网曲库里…')
+        self._refresh_buttons()
         self.load_local()
         self.load_online()
         self.check_library()
+
+    def _refresh_buttons(self):
+        """按「忙不忙 / 在不在曲库里 / 有没有本机 midi」摆一遍上传那几个按钮。"""
+        busy = bool(self._busy or self._publishing)
+        # 确认在联网曲库里才放行（见 check_library）
+        self.upload_btn.setEnabled(self.library is True and not busy)
+        # 本地曲子（不在曲库里）而且手上有 midi 文件：给「上传曲子 + 成绩」这条路
+        publish = (self.library is not True and not busy
+                   and bool(self.midi_path) and os.path.isfile(self.midi_path))
+        self.song_btn.setVisible(publish)
+        self.song_btn.setEnabled(publish)
 
     def _stars_pixmap(self, stars, rainbow, size=34):
         """几颗星画成一张图：前 rainbow 颗是炫彩的。"""
@@ -1861,19 +1902,24 @@ class RhythmResultWindow(QWidget):
             return
         if self.library is not True:
             self.library_hint.setText(
-                '这首歌不在联网曲库里，先不能上线上排名。\n'
-                '想上榜：打开「联网曲库」→「上传 / 整理曲库…」把这首传上去，再回来点'
-                '「刷新排行榜」。本地自己转的 mp3 / 自己做的曲子只能存本机记录。')
+                '这首歌不在联网曲库里。\n'
+                '本地自己转的曲子想上榜，点下面的「上传曲子 + 成绩」—— 一次把曲子传进'
+                '曲库、成绩传上排行榜。\n'
+                '（也可以打开「联网曲库」→「上传 / 整理曲库…」单独传曲子，再回来点'
+                '「刷新排行榜」。）')
             return
         if not self._need_name():
             return
         entry = self._entry()
         self._busy = True
-        self.upload_btn.setEnabled(False)
+        self._refresh_buttons()
         self.hint.setText('正在上传…')
 
         def work():
-            url, why = rhythm.upload(self.song, entry)
+            try:
+                url, why = rhythm.upload(self.song, entry)
+            except Exception as exc:          # 后台线程里绝不能把异常漏出去
+                url, why = '', '上传出错：%s' % exc
             try:
                 self.uploaded.emit(url or ('%d 分' % int(entry.get('score') or 0)), why)
             except RuntimeError:
@@ -1883,12 +1929,90 @@ class RhythmResultWindow(QWidget):
 
     def _on_uploaded(self, url, why):
         self._busy = False
-        self.upload_btn.setEnabled(self.library is True)
+        self._refresh_buttons()
         if why:
             self.hint.setText('上传失败：%s\n（可以先「存到本机」，联网了再传）' % why)
             return
         self.hint.setText('已经传上去了（%s）—— 正在刷新排行榜…' % url)
         self.name_saved.emit(self.name_edit.text())
+        self.load_online()
+
+    def upload_song_and_score(self):
+        """
+        「上传曲子 + 成绩」：本地曲子一键上榜。
+
+        先把这首 midi **公开**传到两套曲库（国内 Gitee + GitHub），传完立刻把这次成绩
+        也传上排行榜 —— 不用先传完曲子再回来重弹一遍。上传 = 公开，先问一句再动手。
+        """
+        if not self.summary or self._busy or self._publishing:
+            return
+        if not self.midi_path or not os.path.isfile(self.midi_path):
+            self.hint.setText('找不到这首歌的 midi 文件，传不了曲子。')
+            return
+        if not self._need_name():
+            return
+        name = os.path.basename(self.midi_path)
+        ask = QMessageBox(self)
+        ask.setWindowTitle('上传曲子 + 成绩')
+        ask.setIcon(QMessageBox.Icon.Question)
+        ask.setText('把《%s》公开传进曲库，并把这次成绩传上排行榜？' % name)
+        ask.setInformativeText(
+            '曲子会进两套曲库（国内 + GitHub），所有人都能下到；\n'
+            '传上去之后这首曲子就能参加线上排名了。')
+        yes = ask.addButton('上传', QMessageBox.ButtonRole.AcceptRole)
+        ask.addButton('算了', QMessageBox.ButtonRole.RejectRole)
+        ask.exec()
+        if ask.clickedButton() is not yes:
+            return
+        entry = self._entry()
+        song, path = self.song, self.midi_path
+        title, artist = self.song_title, self.song_artist
+        self._publishing = True
+        token = object()
+        self._publish_token = token
+        self._refresh_buttons()
+        self.hint.setText('正在上传曲子（两套曲库都传）…')
+
+        def work():
+            try:
+                told, why = library.upload_song_all(path, title, artist)
+            except Exception as exc:              # 后台线程里绝不能把异常漏出去
+                told, why = '', '上传曲子出错：%s' % exc
+            if why:
+                self._emit_song_upload(token, told, '', '曲子没传成：%s' % why)
+                return
+            try:
+                url, why2 = rhythm.upload(song, entry)
+            except Exception as exc:
+                url, why2 = '', '上传成绩出错：%s' % exc
+            self._emit_song_upload(token, told, url, why2)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _emit_song_upload(self, token, told, url, why):
+        try:
+            self.song_uploaded.emit(token, told, url, why)
+        except RuntimeError:
+            pass                      # 窗口已经关了
+
+    def _on_song_uploaded(self, token, told, url, why):
+        if token is not self._publish_token:
+            return                    # 上一首曲子的上传结果，别往这一把上安
+        self._publish_token = None
+        self._publishing = False
+        if told:
+            self.library = True       # 曲子刚传上去，这首已经在曲库里了
+        self._refresh_buttons()
+        if why:
+            if told:
+                self.hint.setText('曲子已经传上去了，但成绩没传成：%s\n'
+                                  '（成绩可以退出去「上传到联网记录」再来一次）' % why)
+            else:
+                self.hint.setText('上传没成功：%s' % why)
+            return
+        self.hint.setText('曲子和成绩都传上去了 —— 正在刷新排行榜…')
+        self.name_saved.emit(self.name_edit.text())
+        self.check_library()
         self.load_online()
 
     def refresh_all(self):
@@ -1918,16 +2042,18 @@ class RhythmResultWindow(QWidget):
 
     def _on_library(self, ok, why):
         self._library_busy = False
+        if ok is None and self.library is True:
+            ok = True     # 已经确认过在曲库里（比如刚把曲子传上去）：一次没查到别把它推翻
         self.library = ok
         self.library_why = why or ''
-        self.upload_btn.setEnabled(ok is True and not self._busy)
+        self._refresh_buttons()
         if ok is True:
             self.library_hint.setText('这首在联网曲库里，成绩可以参加线上排名。')
         elif ok is False:
             self.library_hint.setText(
                 '本地曲子（不在联网曲库里）：音游随便玩、本机记录照存，'
-                '但不能上线上排名。\n想上榜：打开「联网曲库」→「上传 / 整理曲库…」'
-                '把这首传上去。')
+                '但不能上线上排名。\n想上榜：点「上传曲子 + 成绩」，'
+                '一次把曲子传进曲库、成绩传上排行榜。')
         else:
             self.library_hint.setText(
                 '没能确认这首歌在不在联网曲库里（请检查网络连接）%s\n'
@@ -1983,7 +2109,8 @@ class RhythmResultWindow(QWidget):
                              % (index, str(item.get('name') or '?')[:10],
                                 int(item.get('score') or 0),
                                 str(item.get('stars') or 0),
-                                str(item.get('time') or '')[5:16]))
+                                str(item.get('time') or '')[5:16]
+                                + ('（中途）' if item.get('partial') else '')))
             return lines
         lines = block('本机记录（%d 条）' % len(local), local)
         lines.append('')
@@ -2216,6 +2343,7 @@ class MainWindow(QWidget):
         self._update_buttons_now = []  # 当前这场面摆的是哪几个按钮
         self._news_started = False     # 只拉一次（手动「重新检查」会再拉）
         self._news_tried = 0           # 拉过几次（日志里说清楚）
+        self._startup_loading = True   # 启动装载中：这期间不自动弹跟奏框（v1.1.1）
         self._notices_read = set()     # 已经看过的公告 id（存在设置里）
         self._update_seen = ''         # 已经「打过招呼」的新版本号（更新按钮的红点看它）
         self.editor = None             # 「主」编辑器窗口（第一次点「简谱编辑器…」才建）
@@ -2289,6 +2417,7 @@ class MainWindow(QWidget):
             self.open_initial(initial)
         else:
             self.load_default_song()
+        self._startup_loading = False  # 启动装载完了：以后载入曲子才自动弹跟奏框
         # 上次被强杀 / 崩了留下的自动保存：摆回编辑器（正常退出时是空的）
         self._restore_autosave(initial or '')
         # 公告 / 版本信息：等界面先露头，再悄悄去拉（拉不到就安静地算了）
@@ -3523,14 +3652,31 @@ class MainWindow(QWidget):
         except Exception:
             return None
 
-    def _keep_on_screen(self):
-        """窗口别跑到屏幕外面 —— 改完大小顺手把位置拉回来。"""
-        if getattr(self, 'cover_mode', False) or getattr(self, 'overlay_active', False):
+    def _keep_on_screen(self, shrink=False):
+        """
+        窗口别跑到屏幕外面 —— 改完大小顺手把位置拉回来。
+
+        shrink=True：「撑完高之后」的那一次检查（见 _grow_for_picker）。平时的浮层
+        位置是唤起那一刻算好、贴着游戏摆的，不该乱动；但无边框窗口又没有标题栏
+        可以拖，被撑出屏幕就再也拖不回来 —— 撑的那一下必须连位置一起修正。
+        """
+        overlay = (getattr(self, 'cover_mode', False)
+                   or getattr(self, 'overlay_active', False))
+        if overlay and not shrink:
             return                       # 浮层形态的位置是算好的，别动它
         area = self._screen_area()
         if area is None:
             return
         frame = self.frameGeometry()
+        if frame.height() > area.height():
+            # 整个窗口比屏幕还高（屏幕特别矮 / 撑过头）：先压到屏幕里，再摆位置
+            try:
+                self.resize(self.width(),
+                            max(int(self.minimumHeight()),
+                                area.height() - SCREEN_MARGIN))
+            except Exception:
+                pass
+            frame = self.frameGeometry()
         left = min(max(frame.left(), area.left()),
                    max(area.right() - frame.width() + 1, area.left()))
         top = min(max(frame.top(), area.top()),
@@ -4283,6 +4429,9 @@ class MainWindow(QWidget):
         elif action == 'stop':
             if self.practice or self.rhythm_run:
                 log_event('停止音游' if self.rhythm_run else '停止跟奏练习')
+                if self.rhythm_run and self.follow is not None:
+                    # 中途停下也把这一把结掉 —— 卡住 / 半截也能存本机、也能传成绩
+                    self.follow.stop_rhythm()
                 if self.follow is not None:
                     self.follow.cancel()
                 self._on_practice_finish('stop')
@@ -4755,7 +4904,8 @@ class MainWindow(QWidget):
         if window is None:
             return None
         window.set_score(self._shaped_events(), self._speed())
-        if show:
+        # 启动时装进来的那首歌不算「用户要开跟奏」：别一启动就把跟奏框弹出来（v1.1.1）
+        if show and not getattr(self, '_startup_loading', False):
             if self.player.running.is_set():
                 window.begin()
             else:
@@ -4776,6 +4926,8 @@ class MainWindow(QWidget):
             self._refresh_follow(show=True)
         else:
             if self.practice or self.rhythm_run:
+                if self.rhythm_run and self.follow is not None:
+                    self.follow.stop_rhythm()  # 关跟奏 = 中途结束：照样给结算（卡住也能存 / 能传）
                 if self.follow is not None:
                     self.follow.cancel()       # 练习 / 音游中途关掉跟奏 = 结束
                 self._on_practice_finish('stop')   # 兜底：万一没回调也不会卡在练习状态
@@ -5809,17 +5961,24 @@ class MainWindow(QWidget):
         """
         文件列表嵌在主界面里，太矮了不好挑文件，先把它撑高一点。
 
-        撑高之后必须保证整个窗口还在屏幕里：屏幕矮的时候原来会顶出屏幕上边，
-        标题栏跑出去、窗口就拖不回来了。所以上限按屏幕算，超出就把窗口整体上移。
+        撑高之后必须保证整个窗口还在屏幕里。老写法只按「屏幕高度 - 60」封顶，
+        根本没看窗口顶边在哪儿：窗口本身就靠着屏幕下边的时候，撑到 840 会把下沿
+        推出屏幕，系统顺手把整个窗口往上顶，标题栏（浮层形态连标题栏都没有）就跑到
+        屏幕外面去了，拖都拖不回来 —— 用户反馈的就是这个。
+        现在按「窗口顶边到屏幕下沿还剩多少」来撑：顶边一辈子不动，装不下就不长，
+        剩下的部分让列表自己滚动（列表本来就是滚动控件）。
         """
         try:
-            self._size_before_pick = self.size()
+            self._size_before_pick = (self.size(), self.pos())
             area = self._screen_area()
             height = max(self.height(), PICKER_H)
             if area is not None:
-                height = min(height, area.height() - 60)
+                frame = self.frameGeometry()
+                room = area.bottom() - frame.top() + 1 - SCREEN_MARGIN
+                height = min(height, max(room, self.height()))
+                height = min(height, area.height() - SCREEN_MARGIN)
             self.resize(self.width(), height)
-            self._keep_on_screen()
+            self._keep_on_screen(shrink=True)
         except Exception:
             pass
 
@@ -5843,11 +6002,16 @@ class MainWindow(QWidget):
         self.pick_panel.setVisible(False)
         # 按用户的设置还原（默认是关着的）—— 别一收面板就把控制台顶出来
         self.log_view.setVisible(getattr(self, '_log_visible', LOG_VISIBLE_DEFAULT))
-        size = getattr(self, '_size_before_pick', None)
-        if size is not None:
+        # 撑大之前的大小和位置一起还原 —— 撑高的时候可能顺手动过位置，不还原会漂
+        before = getattr(self, '_size_before_pick', None)
+        if before is not None:
             self._size_before_pick = None
             try:
-                self.resize(size)
+                if isinstance(before, tuple):
+                    self.resize(before[0])
+                    self.move(before[1])
+                else:                      # 兜底：万一只存了大小
+                    self.resize(before)
             except Exception:
                 pass
 
@@ -6814,7 +6978,7 @@ class MainWindow(QWidget):
         if was_rhythm:
             self.log('音游结束' + ('：整首走完了' if reason == 'done' else '（中途停止）'))
             log_event('音游结束（%s）' % ('走完' if reason == 'done' else '中途停止'))
-            if reason == 'done' and self._rhythm_result:
+            if self._rhythm_result:          # 中途停下也有结算（见 follow.stop_rhythm）
                 self._show_rhythm_result()
         else:
             self.log('跟奏练习结束' + ('：整首按完了' if reason == 'done' else '（中途停止）'))
@@ -6831,7 +6995,12 @@ class MainWindow(QWidget):
             self._result_window = window
         self._rhythm_shown = True
         # 不再拿上次记住的名字预填（用户要求：名字每次都自己填）
-        window.show_result(rhythm.song_key(self.score_path), self._rhythm_result)
+        # 曲子的身份用 **midi 文件名**：跟曲库索引里的文件名一致，上传曲子 / 分榜才对得上
+        # （拿不到 midi 才退回谱面文件名）。midi 路径也一起给结算窗口，用来一键传曲子。
+        midi = self.midi_path or self.score_path
+        window.show_result(rhythm.song_key(midi), self._rhythm_result,
+                           midi_path=self.midi_path,
+                           title=os.path.splitext(os.path.basename(midi or ''))[0])
         self._present_popup(window)
 
     def _remember_rhythm_name(self, name):

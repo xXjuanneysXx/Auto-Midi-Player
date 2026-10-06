@@ -47,7 +47,16 @@ DEFAULT_FILES = ('payload.json', 'notice.json', 'version.json', 'update.json', '
 # ⚠ 这里**故意不含 library.json** —— 仓库里那份是程序「上传 / 整理曲库」时生成的，
 #   本地这份只是个旧快照，推上去会把歌单覆盖坏。
 COMPANION_FILES = ('快速上手/快速上手.md', '音游记录/README.md', '错误报告/README.md',
-                   'rhythm.json', 'themes.json', 'error_report.json')
+                   '音游记录/曲目索引.json', 'rhythm.json', 'themes.json',
+                   'error_report.json')
+
+# **只在 Gitee** 推的（用户要求）：线上排名 / 音游成绩不放 GitHub —— 那边国内经常拉不到。
+GITEE_ONLY = ('音游记录/',)
+
+
+def gitee_only(name):
+    """这个文件是不是只往 Gitee 推。"""
+    return any(str(name).startswith(prefix) for prefix in GITEE_ONLY)
 
 
 def log(text):
@@ -167,7 +176,13 @@ def main(argv=None):
 
     code = 0
     for site in (library.SITE_GITEE, library.SITE_GITHUB):
-        code = max(code, push(site, pairs, dry_run=args.dry_run))
+        todo = [(name, path) for name, path in pairs
+                if site == library.SITE_GITEE or not gitee_only(name)]
+        if not todo:
+            continue
+        if site == library.SITE_GITHUB and len(todo) != len(pairs):
+            log('· GitHub 只推 %d 个（音游记录那些只在 Gitee）' % len(todo))
+        code = max(code, push(site, todo, dry_run=args.dry_run))
     return code
 
 
