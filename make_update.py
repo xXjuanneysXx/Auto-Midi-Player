@@ -165,6 +165,35 @@ def diff(old_files, new_files):
     return changed, removed
 
 
+def patch_fingerprint(files, changed, removed):
+    """
+    一份差分包的「内容指纹」：只看「要写哪些文件、每个文件的新 sha256、要删哪些」。
+
+    同样的改动集合，因为 zip 里 `_patch\\manifest.json` 的 `from` 字段和打包时间
+    不同，打出来的字节不一样、sha256 也不一样；可更新器真正认的只有 files /
+    removed（`updater.apply_patch()` 不看 `from`）。所以指纹一样 = 两份包可以换着用，
+    于是只传一份、update.json 里多条 entry 指同一个 URL —— 这就是
+    `docs\\发版策略.md` 里的「方案 C」，包数从此跟历史版本数量无关。
+    """
+    parts = ['%s|%s' % (rel.lower(), (files.get(rel) or {}).get('sha256', ''))
+             for rel in sorted(changed)]
+    parts.append('--removed--')
+    parts.extend(sorted(str(rel).lower() for rel in (removed or [])))
+    return hashlib.sha1('\n'.join(parts).encode('utf-8')).hexdigest()
+
+
+def entry_fingerprint(key, src, dst):
+    """按「src 版 → dst 版」两份清单算出这份差分包的指纹；清单不全就算了（返回 ''）。"""
+    old_files = load_manifest(src, key)
+    new_files = load_manifest(dst, key)
+    if not old_files or not new_files:
+        return ''
+    changed, removed = diff(old_files, new_files)
+    if not changed and not removed:
+        return ''
+    return patch_fingerprint(new_files, changed, removed)
+
+
 def build_patch(payload, out_dir, key, version, old_version, changed, removed, new_files):
     name = 'AutoPlay-patch-%s-%s-to-%s.zip' % (key, old_version, version)
     out = os.path.join(out_dir, name)
@@ -254,13 +283,48 @@ def package_info(version, key):
             'sha256': sha256_file(path)}, name
 
 
+def dedupe_patches(key, entries):
+    """
+    「内容一模一样」的差分包只留一条 URL，其余条目改指同一份。
+
+    返回 (改好的条目, 可以删掉的附件名)。指纹一样就说明两份包的 files / removed
+    完全相同 —— 更新器只认 zip 里那份 manifest，不看你从哪一版升上来，所以让
+    多条 from 共用一份包是**等价变换**（见 `docs\\发版策略.md` §4 方案 C）。
+    清单不全、算不出指纹的条目原样保留。
+    """
+    keep = {}
+    out = []
+    before = []
+    for item in entries:
+        was = str(item.get('url') or '')
+        before.append(os.path.basename(urllib.parse.unquote(was)))
+        fp = entry_fingerprint(key, item.get('from'), item.get('to'))
+        hit = keep.get(fp) if fp else None
+        if hit is None:
+            if fp:
+                keep[fp] = item
+            out.append(item)
+            continue
+        out.append(dict(item, url=hit.get('url'), size=hit.get('size'),
+                        sha256=hit.get('sha256')))
+    used = set(os.path.basename(urllib.parse.unquote(str(item.get('url') or '')))
+               for item in out)
+    gone = []
+    for name in before:
+        if name and name not in used and name not in gone:
+            gone.append(name)
+    return out, gone
+
+
 def build_update_json(version, patches, out_dir, patch_base, package_base,
-                      notes='', min_supported='', previous=None):
+                      notes='', min_supported='', previous=None, dedupe=True):
     """
     patches: {完全版/精简版: [这次新做的差分包条目]}
     previous: 上一版 update.json 里的 editions —— 它挂着的旧差分包原样接着用。
+    dedupe: 内容完全相同的差分包只留一份 URL（方案 C），返回「多出来的那些附件名」。
     """
     editions = {}
+    dropped = []
     for key, label in EDITIONS:
         files = load_manifest(version, key) or {}
         pkg, _name = package_info(version, key)
@@ -290,6 +354,12 @@ def build_update_json(version, patches, out_dir, patch_base, package_base,
         # 1.0.4 的用户就先升到 1.0.5 去了，得再点一次更新才能到最新版。
         entry['patches'] = [buckets[tag] for tag in sorted(
             buckets, key=lambda tag: (_ver_tuple(tag[0]), tuple(-n for n in _ver_tuple(tag[1]))))]
+        if dedupe:
+            entry['patches'], gone = dedupe_patches(key, entry['patches'])
+            for name in gone:
+                log('  · %s：%s 内容跟别的包一样，不再引用（可以从 Releases 上删掉）'
+                    % (label, name))
+                dropped.append(name)
         editions[key] = entry
     data = {
         'format': FORMAT_UPDATE,
@@ -304,7 +374,7 @@ def build_update_json(version, patches, out_dir, patch_base, package_base,
     with open(path, 'w', encoding='utf-8') as handle:
         json.dump(data, handle, ensure_ascii=False, indent=2)
         handle.write('\n')
-    return path, data
+    return path, data, dropped
 
 
 # ---------- 主流程 ----------
@@ -323,6 +393,8 @@ def main(argv=None):
     parser.add_argument('--package-base', default='', help='完整安装包上传后的地址前缀')
     parser.add_argument('--notes', default='', help='写进 update.json 的更新说明')
     parser.add_argument('--min-supported', default='', help='低于这个版本必须走完整包')
+    parser.add_argument('--no-dedupe', action='store_true',
+                        help='每个旧版本各打一份包（老行为）；默认把内容一样的合成一份')
     args = parser.parse_args(argv)
 
     version = str(args.version).strip().lstrip('vV')
@@ -352,6 +424,8 @@ def main(argv=None):
     out_dir = os.path.join(OUT_DIR, version)
     os.makedirs(out_dir, exist_ok=True)
     made = {}
+    dedupe = not args.no_dedupe
+    built = {}                 # (版面, 指纹) -> 已经打好的那份包：内容一样就不重复打
     for key, label in EDITIONS:
         for old_version in old_versions:
             old_files = load_manifest(old_version, key)
@@ -363,12 +437,24 @@ def main(argv=None):
             if not changed and not removed:
                 log('[=] %s 跟 %s 一模一样，没有增量可做。' % (label, old_version))
                 continue
+            fingerprint = patch_fingerprint(new_manifests[key], changed, removed)
+            hit = built.get((key, fingerprint)) if dedupe else None
+            if hit is not None:
+                made.setdefault(key, []).append({
+                    'from': old_version, 'to': version, 'name': hit['name'],
+                    'size': hit['size'], 'sha256': hit['sha256'],
+                    'removed': removed, 'changed': len(changed)})
+                log('%s %s -> %s 的改动跟 %s 完全一样，共用同一份包（不重复打）'
+                    % (label, old_version, version, hit['from']))
+                continue
             path, name = build_patch(payload_path(key), out_dir, key, version, old_version,
                                      changed, removed, new_manifests[key])
-            made.setdefault(key, []).append({
+            info = {
                 'from': old_version, 'to': version, 'name': name,
                 'size': os.path.getsize(path), 'sha256': sha256_file(path),
-                'removed': removed, 'changed': len(changed)})
+                'removed': removed, 'changed': len(changed)}
+            built[(key, fingerprint)] = info
+            made.setdefault(key, []).append(info)
             log('%s 差分包好了：%s（%s -> %s，改了 %d 个、删了 %d 个，%.1f MB）'
                 % (label, path, old_version, version, len(changed), len(removed),
                    os.path.getsize(path) / 1048576.0))
@@ -387,13 +473,19 @@ def main(argv=None):
     if carry_path:
         log('旧差分包接着用：%s（清单里已经挂着的那些，不重做）' % carry_path)
 
-    path, data = build_update_json(version, made, out_dir,
-                                   args.patch_base, args.package_base,
-                                   notes=args.notes, min_supported=args.min_supported,
-                                   previous=previous)
+    path, data, dropped = build_update_json(version, made, out_dir,
+                                            args.patch_base, args.package_base,
+                                            notes=args.notes,
+                                            min_supported=args.min_supported,
+                                            previous=previous, dedupe=dedupe)
     total = sum(len((entry.get('patches') or [])) for entry in data['editions'].values())
     log('update.json 好了：%s（latest=%s，清单里差分包 %d 条）'
         % (path, version, total))
+    if dropped:
+        log('')
+        log('下面这些附件现在没人引用了（内容跟保留下来的那份完全一样，客户端照常升级）：')
+        for name in dropped:
+            log('    %s' % name)
     log('')
     log('接下来把这些传上去（见 docs\\增量更新设计.md）：')
     log('  差分包  -> Gitee Releases 附件（+ GitHub Releases 各一份）')

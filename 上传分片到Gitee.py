@@ -37,6 +37,7 @@ import argparse
 import json
 import os
 import sys
+import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -66,6 +67,23 @@ def gitee_token():
 def load_manifest():
     with open(MANIFEST, encoding='utf-8') as handle:
         return json.load(handle)
+
+
+def referenced_patches():
+    """update.json 里真正引用到的差分包文件名（--patches 只传这几个）。"""
+    path = os.path.join(HERE, '曲库索引', 'update.json')
+    try:
+        with open(path, encoding='utf-8') as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return set()
+    out = set()
+    for entry in (data.get('editions') or {}).values():
+        for item in ((entry or {}).get('patches') or []):
+            url = str((item or {}).get('url') or '')
+            if url:
+                out.add(urllib.parse.unquote(url.rsplit('/', 1)[-1]))
+    return out
 
 
 def find_release(tag, token, create=True):
@@ -126,12 +144,11 @@ def push_manifest():
     code = 0
     for site in (library.SITE_GITEE, library.SITE_GITHUB):
         label = library.SITE_LABELS.get(site, site)
-        info, why = library.backend_of(library.default_index_url(site))
-        if info is None:
+        _site, owner, repo, branch, why = library.backend_of(library.default_index_url(site))
+        if not (owner and repo):
             log('  [%s] 跳过：%s' % (label, why))
             code = 1
             continue
-        owner, repo, branch = info
         token = library.get_token(site)
         if not token:
             log('  [%s] 跳过：没有令牌' % label)
@@ -178,11 +195,21 @@ def main(argv=None):
                            int(part['size']), info.get('label') or key))
     if args.patches:
         patch_dir = os.path.join(HERE, '更新包', tag.lstrip('vV'))
+        # 只传 update.json 里**真正引用**的那几份：make_update.py 会把「改动集合完全
+        # 相同」的差分包合成一份（方案 C），同一目录里那些多出来的重复包没人引用，
+        # 传上去纯属白占 Gitee 那 1 GB 的附件配额（真踩过）。
+        reference = referenced_patches()
         names = sorted(os.listdir(patch_dir)) if os.path.isdir(patch_dir) else []
+        skipped = [name for name in names
+                   if name.lower().endswith('.zip') and name not in reference]
         for name in names:
             if name.lower().endswith('.zip'):
+                if reference and name not in reference:
+                    continue
                 path = os.path.join(patch_dir, name)
                 wanted.append((name, path, os.path.getsize(path), '差分包'))
+        for name in skipped:
+            log('· %s 没人引用（内容跟别的包一样），不传' % name)
         if not names:
             log('[!] 没找到 %s —— 先跑一遍 make_update.py' % patch_dir)
     for path in args.file:
