@@ -21,6 +21,7 @@ r"""
     python -X utf8 推送曲库索引.py                # 推
     python -X utf8 推送曲库索引.py --only payload.json update.json
     python -X utf8 推送曲库索引.py --manifests
+    python -X utf8 推送曲库索引.py --extras        # 顺手把「快速上手」手册等配套文件也推上去
 
 跟仓库里内容**一模一样**的会跳过（比对 git blob sha1），所以重跑不会刷一堆空提交。
 令牌用的是程序里那两个（`gitee_token_local.py` / `github_token_local.py`），
@@ -33,6 +34,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -41,6 +43,11 @@ import library                                                     # noqa: E402
 
 INDEX_DIR = os.path.join(HERE, '曲库索引')
 DEFAULT_FILES = ('payload.json', 'notice.json', 'version.json', 'update.json', 'README.md')
+# 配套文件（`--extras`）：程序联网拉的手册、几个开关 json、目录说明。
+# ⚠ 这里**故意不含 library.json** —— 仓库里那份是程序「上传 / 整理曲库」时生成的，
+#   本地这份只是个旧快照，推上去会把歌单覆盖坏。
+COMPANION_FILES = ('快速上手/快速上手.md', '音游记录/README.md', '错误报告/README.md',
+                   'rhythm.json', 'themes.json', 'error_report.json')
 
 
 def log(text):
@@ -72,12 +79,25 @@ def manifest_files(version):
 
 
 def remote_sha(site, owner, repo, branch, path, token, timeout=30):
-    """仓库里这个文件现在的 sha（没有 / 读不到就给空的）。"""
+    """
+    仓库里这个文件现在的 sha。返回 (sha, 出错信息)。
+
+    文件不存在（要新建）时 sha=''、出错信息也空；**网络层失败**（GitHub 的 contents
+    接口偶尔会 IncompleteRead）会重试几次 —— 读不到 sha 就直接 PUT，GitHub 会回
+    422「sha wasn't supplied」，那种 422 看着像权限问题，其实只是没读到。
+    """
     url = library._contents_url(site, owner, repo, path, branch)
-    data, _code, _why = library._api_raw(url, token, timeout=timeout, site=site)
-    if isinstance(data, dict):
-        return str(data.get('sha') or '')
-    return ''
+    last = ''
+    for attempt in (1, 2, 3):
+        data, code, why = library._api_raw(url, token, timeout=timeout, site=site)
+        if isinstance(data, dict) and data.get('sha'):
+            return str(data['sha']), ''
+        if code == 0:                 # 网络层失败：等一下再试
+            last = why or '网络错误'
+            time.sleep(1.5 * attempt)
+            continue
+        return '', ''                 # 404 / 空响应 = 还没有这个文件，当新建
+    return '', '读远端失败：%s' % last
 
 
 def push(site, pairs, dry_run=False, timeout=60):
@@ -96,7 +116,11 @@ def push(site, pairs, dry_run=False, timeout=60):
         with open(local, 'rb') as handle:
             data = handle.read()
         want = git_blob_sha(data)
-        have = remote_sha(site, owner, repo, branch, remote, token)
+        have, bad = remote_sha(site, owner, repo, branch, remote, token)
+        if bad:
+            log('    %-24s [x] %s' % (remote, bad))
+            code = 1
+            continue
         if have == want:
             log('    %-24s 没变，跳过' % remote)
             continue
@@ -118,10 +142,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='把曲库索引推到两个曲库仓库')
     parser.add_argument('--only', nargs='*', default=[], help='只推这几个（默认推一整套）')
     parser.add_argument('--manifests', action='store_true', help='连 manifests\\<最新版>-*.json 一起推')
+    parser.add_argument('--extras', action='store_true', help='连「快速上手」手册等配套文件一起推')
     parser.add_argument('--dry-run', action='store_true', help='只说要改哪些')
     args = parser.parse_args(argv)
 
     names = tuple(args.only) if args.only else DEFAULT_FILES
+    if args.extras:
+        names += COMPANION_FILES
     pairs = []
     for name in names:
         path = os.path.join(INDEX_DIR, name)

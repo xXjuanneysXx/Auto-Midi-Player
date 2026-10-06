@@ -14,6 +14,7 @@ r"""
     python -X utf8 上传分片到Gitee.py               # 传切片（已传过的跳过）
     python -X utf8 上传分片到Gitee.py --manifest    # 顺手把 payload.json 发到两个曲库仓库
     python -X utf8 上传分片到Gitee.py --patches     # 顺手把 更新包\<版本>\*.zip（增量差分包）也传上去
+    python -X utf8 上传分片到Gitee.py --file "发布\AutoPlay 在线安装程序 v1.1.0.exe"
     python -X utf8 上传分片到Gitee.py --list        # 看看这个 Release 现在挂了哪些附件
     python -X utf8 上传分片到Gitee.py --tag v1.1.0  # 换一个版本
 
@@ -152,6 +153,8 @@ def main(argv=None):
     parser.add_argument('--manifest', action='store_true', help='顺手把 payload.json 发到两个曲库仓库')
     parser.add_argument('--patches', action='store_true',
                         help='顺手把 更新包\\<版本>\\*.zip（增量差分包）也传上来')
+    parser.add_argument('--file', action='append', default=[], metavar='路径',
+                        help='再加一个要传的附件（可以写多次），比如在线安装程序那个 exe')
     parser.add_argument('--no-create', action='store_true', help='Release 不存在时不自动建')
     args = parser.parse_args(argv)
 
@@ -182,6 +185,12 @@ def main(argv=None):
                 wanted.append((name, path, os.path.getsize(path), '差分包'))
         if not names:
             log('[!] 没找到 %s —— 先跑一遍 make_update.py' % patch_dir)
+    for path in args.file:
+        path = os.path.abspath(path)
+        if not os.path.isfile(path):
+            log('[x] 没有这个文件：%s' % path)
+            return 1
+        wanted.append((os.path.basename(path), path, os.path.getsize(path), '额外的附件'))
     log('· 清单：%s（%d 个附件）' % (tag, len(wanted)))
 
     if args.dry_run:
