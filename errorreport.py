@@ -232,6 +232,11 @@ def sanitize(text):
     return text
 
 
+def has_chinese(text):
+    """这段文字里有没有中文（只回布尔值）—— 「路径是不是中文的」标记用它。"""
+    return _cjk(text)
+
+
 def paths_have_chinese(text):
     """traceback 里出现的路径有没有中文（只回布尔值，不回路径本身）。"""
     text = str(text or '')

@@ -38,6 +38,7 @@ TOTAL_BUDGET = 9.0           # 一个文件从头试到尾最多花这么久（�
 
 CACHE_VERSION = 'version.cache.json'     # 上次拉到的版本信息（网络抽风时兜底）
 CACHE_NOTICE = 'notice.cache.json'       # 上次拉到的公告
+CACHE_TEXT = 'text.cache.%s'            # 拉到的纯文本（快速上手手册）先缓存一份
 
 _SITE_SHORT = {library.SITE_GITEE: 'Gitee', library.SITE_GITHUB: 'GitHub'}
 
@@ -240,6 +241,51 @@ def update_info(timeout=DEFAULT_TIMEOUT, version=None):
     if fmt and fmt != FORMAT_UPDATE:
         return {}, '这不像更新清单（format=%s）' % fmt
     return data, ''
+
+
+def _safe_name(name):
+    """把仓库里的路径压成一个能当文件名的东西（快速上手/手册.md -> 手册.md）。"""
+    base = str(name or '').replace('\\', '/').rstrip('/').rsplit('/', 1)[-1]
+    keep = ''.join(ch if (ch.isalnum() or ch in '._-') else '_' for ch in base)
+    return keep or 'text'
+
+
+def text_file(name, timeout=DEFAULT_TIMEOUT):
+    """
+    拉一个纯文本文件（快速上手手册是 md），返回 (文本, 出错信息)。
+
+    拉到了就顺手缓存一份到本机：下次网络抽风 / 离线时，界面上还能看到上次那份，
+    why 里带着这次失败的原因（界面自己决定要不要提一句）。
+    """
+    text, why = _fetch_text(name, timeout=timeout)
+    if text:
+        _write_text_cache(name, text)
+        return text, ''
+    cached = _read_text_cache(name)
+    if cached:
+        return cached, why
+    return '', why
+
+
+def _text_cache_path(name):
+    return os.path.join(library.cache_dir(), CACHE_TEXT % _safe_name(name))
+
+
+def _read_text_cache(name):
+    try:
+        with open(_text_cache_path(name), 'r', encoding='utf-8') as handle:
+            return handle.read()
+    except Exception:
+        return ''
+
+
+def _write_text_cache(name, text):
+    try:
+        os.makedirs(library.cache_dir(), exist_ok=True)
+        with open(_text_cache_path(name), 'w', encoding='utf-8') as handle:
+            handle.write(text)
+    except OSError:
+        pass
 
 
 def _notices_of(data):

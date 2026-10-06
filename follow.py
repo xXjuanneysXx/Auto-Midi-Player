@@ -24,6 +24,7 @@
 """
 
 import ctypes
+import math
 import theme
 import time
 from bisect import bisect_left, bisect_right
@@ -39,7 +40,9 @@ except ImportError:                                       # 装了 PyQt6 也行
     from PyQt6.QtWidgets import QApplication, QWidget
 
 import jianpu
+import judgeicons
 import player as player_mod
+import rhythm
 
 
 # 一个音在界面上需要的全部信息
@@ -70,9 +73,11 @@ def _reload_theme_colors():
     WRONG_FLASH = theme.c('#f08a8a')
 
 
-# 跟奏的两种节奏：默认「等我按对」（练习模式），另一个是按原曲速度自动走
-PACE_MODES = ('等我按对', '原速跟奏')
+# 跟奏的三个节奏：默认「等我按对」（练习模式），「原速跟奏」跟着演奏器走，
+# 「音游模式」是原速下落 + 判定计分的玩法（判定 / 计分见 rhythm.py）。
+PACE_MODES = ('等我按对', '原速跟奏', '音游模式')
 PRACTICE_PACE = PACE_MODES[0]
+RHYTHM_PACE = PACE_MODES[2]
 
 # 顶上那条操作说明（图例）的每一行：色块用 NOTE_COLORS 里的颜色，文字说明它代表什么。
 # 「等长演奏」时一个音只有 90 毫秒那么长，色块短得写不下 ↑ / # 记号，颜色就是唯一的
@@ -82,6 +87,43 @@ LEGEND_ITEMS = (('', '正常'), ('#', '升半音'), ('A', '升调'),
 
 # 练习模式：音符离判定线还有这么近（秒）时，抢拍按下去也算数
 EARLY_WINDOW = 0.25
+
+# 鼠标左 / 中 / 右 = 降调 / 升半音 / 升调 —— 跟录制时的操作一模一样。
+# 顺序无所谓，但拼出来的记号必须和 NOTE_COLORS 的 key 对上（'' / # / A / B / #A / #B）。
+MOUSE_BUTTONS = (('B', '左', '降调', 0x01),      # 左键
+                 ('#', '中', '升半音', 0x04),    # 中键
+                 ('A', '右', '升调', 0x02))      # 右键
+
+RHYTHM_COUNTDOWN = 3.6          # 音游模式开局倒计时（秒）：3、2、1、GO
+COMBO_GRACE = 0.09              # 音游：琴键和鼠标几乎同时按才算对，手指顺序反了给这点宽容
+COMBO_SHOW = 3                  # 连击到几个才显示「xN」
+
+
+def read_mouse_combo():
+    """现在按着哪几个鼠标键，拼成 NOTE_COLORS 里那套记号（'' / # / A / B / #A / #B）。"""
+    try:
+        user32 = ctypes.windll.user32
+        down = {letter: bool(user32.GetAsyncKeyState(vk) & 0x8000)
+                for letter, _short, _long, vk in MOUSE_BUTTONS}
+    except Exception:
+        return ''
+    combo = ''
+    if down.get('#'):
+        combo += '#'
+    if down.get('A'):
+        combo += 'A'
+    if down.get('B'):
+        combo += 'B'
+    return combo
+
+
+def judge_flash(result):
+    """这个判定该把那一列闪成什么色。"""
+    if result in (rhythm.PERFECT, rhythm.GOOD):
+        return CORRECT_FLASH
+    if result == rhythm.PLAIN:
+        return theme.c('#8b93a7')     # 按到了但差太多：灰的（给了分，只是不够准）
+    return WRONG_FLASH                # 按错键 / 漏按：闪红
 
 
 class FollowWindow(QWidget):
@@ -106,6 +148,7 @@ class FollowWindow(QWidget):
     LEGEND_BAR_H = 7       # 多高（细得像一条线，跟音符长条一个颜色）
     HEADER_H = 26          # 顶上那行状态字
     KEYS_H = 50            # 琴键高度
+    MOUSE_H = 24           # 琴键下面那条鼠标指示（左 / 中 / 右三个小方块）
     FRAME_H = 22           # 判定框高度
     FRAME_GAP = 8          # 判定框和琴键之间的缝
     LOOKAHEAD = 3.0        # 音符提前几秒出现在面板顶上
@@ -118,6 +161,8 @@ class FollowWindow(QWidget):
         'lead':  ('准备中…', theme.c('#7fb0ff')),
         'play':  ('演奏中', theme.c('#5fd18b')),
         'practice': ('练习中', theme.c('#5fd18b')),
+        'countdown': ('准备…', theme.c('#ffc247')),
+        'rhythm': ('音游中', theme.c('#7fb0ff')),
         'waiting':  ('该你按了', theme.c('#ffc247')),
         'pause': ('已暂停', theme.c('#e0b341')),
         'stop':  ('已停止', theme.c('#9aa6ba')),
@@ -125,7 +170,8 @@ class FollowWindow(QWidget):
     }
 
     # 这些状态下音符是「活的」（要画出来）
-    MOVING_STATES = ('lead', 'play', 'pause', 'practice', 'waiting')
+    MOVING_STATES = ('lead', 'play', 'pause', 'practice', 'waiting', 'countdown',
+                     'rhythm')
 
     def __init__(self, player=None, parent=None):
         super().__init__(parent, Qt.WindowType.FramelessWindowHint
@@ -138,7 +184,8 @@ class FollowWindow(QWidget):
         # 鼠标必须能穿过去：升降调 / 升半音按的就是鼠标键，被这一层挡住就发不进游戏了
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setFixedSize(self.LANE_W * len(self.KEYS) + self.PAD * 2, 470 + self.LEGEND_H)
+        self.setFixedSize(self.LANE_W * len(self.KEYS) + self.PAD * 2,
+                          470 + self.MOUSE_H + self.LEGEND_H)
 
         self.player = player
         self.notes = []                       # 全部音符，按开始时间排好
@@ -162,6 +209,23 @@ class FollowWindow(QWidget):
         self.on_progress = None               # 练习进度回调 (已完成, 总数)
         self.on_finish = None                 # 练习结束回调 ('done' / 'stop')
 
+        # 鼠标键状态（练习模式拿它判定 / 显化，音游模式拿它算分）
+        self._mouse = ''
+        self._prev_mouse = ''
+
+        # 音游模式
+        self.mode = 'follow'                  # follow / practice / rhythm
+        self.session = None                   # rhythm.Session
+        self._countdown = 0.0
+        self._armed = {}                      # 列号 -> (按下时刻, 宽容截止, 音符下标)
+        self._judge = ''                      # 最近一次判定
+        self._judge_expire = 0.0
+        self._judge_note = None
+        self._badges = {}                     # 判定牌位图缓存
+        self._result = None                   # 结算（dict，见 rhythm.Session.summary）
+        self.on_result = None                 # 音游结算回调 (summary)
+        self._rhythm_done = False             # 这一把是不是已经结算过了（防每帧重复结算）
+
         self._symbol_font = QFont('Microsoft YaHei UI', 9)
         self._symbol_font.setBold(True)
 
@@ -176,6 +240,7 @@ class FollowWindow(QWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(max(int(1000 / self.FPS), 8))
         self._timer.timeout.connect(self._tick)
+        self._fit_row()
 
     # ---------- 对外接口 ----------
 
@@ -205,6 +270,10 @@ class FollowWindow(QWidget):
         self._t = self._starts[0] if self._starts else 0.0
         self._wait_index = 0
         self._flash.clear()
+        self._armed.clear()
+        self.session = None
+        self._judge = ''
+        self._result = None
         self.update()
 
     def set_player(self, player):
@@ -213,6 +282,12 @@ class FollowWindow(QWidget):
     def set_ready(self):
         """读好谱面、等开始。"""
         self.paced = False
+        self.mode = 'follow'
+        self._fit_row()
+        self.session = None
+        self._armed.clear()
+        self._judge = ''
+        self._result = None
         self._paused = False
         self._wait_index = 0
         self.state = 'ready' if self.notes else 'idle'
@@ -227,6 +302,12 @@ class FollowWindow(QWidget):
         wait=True ：练习模式，时间由你的手推着走（程序不发按键）。
         """
         self.paced = bool(wait)
+        self.mode = 'practice' if wait else 'follow'
+        self._fit_row()
+        self.session = None
+        self._armed.clear()
+        self._judge = ''
+        self._result = None
         self._paused = False
         self._wait_index = 0
         self._flash.clear()
@@ -249,8 +330,12 @@ class FollowWindow(QWidget):
         return self._paused
 
     def cancel(self):
-        """练习中途停止。"""
+        """练习 / 音游中途停止。"""
         self.paced = False
+        self.mode = 'follow'
+        self._fit_row()
+        self.session = None
+        self._armed.clear()
         self._paused = False
         self.state = 'stop'
         self._fire_finish('stop')
@@ -400,14 +485,23 @@ class FollowWindow(QWidget):
     # ---------- 每帧 ----------
 
     def _tick(self):
-        """对时间、看一眼哪几个键被按住，有变化才重画。"""
+        """对时间、看一眼哪几个键 / 鼠标键被按住，有变化才重画。"""
         held = self._read_keys()
-        changed = held != self._held
+        self._mouse = read_mouse_combo()
+        mouse_edge = self._mouse != self._prev_mouse
+        changed = held != self._held or mouse_edge
         edges = [index for index, down in enumerate(held) if down and not self._prev_held[index]]
+        releases = [index for index, down in enumerate(held)
+                    if not down and self._prev_held[index]]
         self._prev_held = held
+        self._prev_mouse = self._mouse
         self._held = held
+        if self.mode == 'rhythm':
+            self._tick_rhythm(edges, releases)
+            self.update()
+            return
         if self.paced:
-            self._tick_practice(edges)
+            self._tick_practice(edges, mouse_edge)
             self.update()
             return
         elapsed = None
@@ -423,12 +517,13 @@ class FollowWindow(QWidget):
         if changed or elapsed is not None:
             self.update()
 
-    def _tick_practice(self, edges):
+    def _tick_practice(self, edges, mouse_edge=False):
         """
         练习模式：时间由你的手推着走。
 
-        音符照常往下落，但落到判定线就停住 —— 按对那个键才继续。按错了不往前走，
-        只把那一列闪一下红，免得越按越乱。
+        音符照常往下落，但落到判定线就停住 —— **琴键和鼠标组合都按对**才继续
+        （键先按还是鼠标先按都行）。按错了不往前走，只把那一列闪一下红，
+        免得越按越乱。
         """
         now = time.perf_counter()
         delta = max(now - self._last_wall, 0.0)
@@ -445,7 +540,10 @@ class FollowWindow(QWidget):
             return
         target = self.notes[self._wait_index]
         early = target.start - self._t <= EARLY_WINDOW
-        if target.lane in edges and (self._clamped() or early):
+        ok = self._combo_ok(target)
+        # 每一帧都算一遍「现在这样算不算按对」：琴键按住 + 鼠标组合对上了 ——
+        # 键先按还是鼠标先按都行，不用去管谁先谁后
+        if ok and self._held[target.lane] and (self._clamped() or early):
             self._wait_index += 1
             self._flash[target.lane] = (now + 0.22, CORRECT_FLASH)
             if self._wait_index >= len(self.notes):
@@ -455,7 +553,10 @@ class FollowWindow(QWidget):
                 return
             target = self.notes[self._wait_index]
             self._fire_progress()
-        elif edges:
+        elif (target.lane in edges or mouse_edge) and not ok:
+            # 键按对了但升降调 / 半音不对（或者刚按错鼠标）：闪红，不放行
+            self._flash[target.lane] = (now + 0.22, WRONG_FLASH)
+        if edges:
             for lane in edges:
                 if lane != target.lane:
                     self._flash[lane] = (now + 0.22, WRONG_FLASH)
@@ -465,6 +566,120 @@ class FollowWindow(QWidget):
         else:
             self._t = target.start                  # 压在线上了，等你按
             self.state = 'waiting'
+
+    def _combo_ok(self, note):
+        """这个音要的鼠标组合，现在正按着吗。"""
+        return self._mouse == getattr(note, 'color', '')
+
+    # ---------- 音游模式 ----------
+
+    def begin_rhythm(self, countdown=None):
+        """
+        音游模式：原速下落、程序一个键都不发，你按对才得分。
+
+        先来一段 321 倒计时（这期间音符停在顶上不动），然后时间由秒表推着走 ——
+        判定 / 计分见 rhythm.py。
+        """
+        self.paced = False
+        self.mode = 'rhythm'
+        self._fit_row()
+        self._rhythm_done = False
+        self._paused = False
+        self._flash.clear()
+        self._armed.clear()
+        self._judge = ''
+        self._judge_expire = 0.0
+        self._result = None
+        self._countdown = float(RHYTHM_COUNTDOWN if countdown is None else countdown)
+        self._last_wall = time.perf_counter()
+        self.session = rhythm.Session(self.notes)
+        self._t = (self.notes[0].start - self.LOOKAHEAD) if self.notes else 0.0
+        self.state = 'countdown' if self.notes else 'done'
+        self.show_panel()
+
+    def _tick_rhythm(self, edges, releases):
+        """音游模式的每帧：推时间轴、收按键、结算。"""
+        if self._rhythm_done:
+            return                            # 结算过了就别再动（不然每帧都会重开一次结算）
+        now = time.perf_counter()
+        delta = max(now - self._last_wall, 0.0)
+        self._last_wall = now
+        for lane, (expire, _) in list(self._flash.items()):
+            if expire < now:
+                del self._flash[lane]
+        if self._paused or self.session is None:
+            return
+        if self._countdown > 0:
+            self._countdown -= delta
+            self.state = 'countdown'
+            if self._countdown > 0:
+                return
+            self._countdown = 0.0
+        self.state = 'rhythm'
+        self._t += delta
+
+        judged = list(self.session.tick(self._t))
+        # 键先按、鼠标晚一点点：给 COMBO_GRACE 的宽容，别因为手指顺序反了就白扣
+        for lane in list(self._armed):
+            pressed_at, deadline, index = self._armed[lane]
+            if self.session.cursor != index:
+                del self._armed[lane]                     # 这个音已经判过了
+                continue
+            if self._combo_ok(self.session.notes[index]):
+                judged.extend(self.session.hit(lane, self._mouse, pressed_at))
+                del self._armed[lane]
+            elif now >= deadline:
+                judged.extend(self.session.hit(lane, self._mouse, pressed_at))
+                del self._armed[lane]
+        for lane in edges:
+            if lane in self._armed:
+                continue
+            target = self.session.pending()
+            if (target is not None and getattr(target, 'lane', -1) == lane
+                    and self._t >= target.start - self.session.early
+                    and not self._combo_ok(target) and target.color):
+                self._armed[lane] = (self._t, now + COMBO_GRACE, self.session.cursor)
+                continue
+            judged.extend(self.session.hit(lane, self._mouse, self._t))
+        for lane in releases:
+            armed = self._armed.pop(lane, None)
+            if armed is not None:
+                judged.extend(self.session.hit(lane, self._mouse, armed[0]))
+            judged.extend(self.session.release(lane, self._t))
+        for result, note in judged:
+            self._note_judged(result, note, now)
+        if self.session.done or (self.notes
+                                 and self._t > self.notes[-1].start
+                                 + max(self.notes[-1].dur, 0.35) + 0.6):
+            self._finish_rhythm()
+
+    def _note_judged(self, result, note, now):
+        """判了一个音：记下来画 HUD，顺便让那一列闪一下。"""
+        self._judge = result
+        self._judge_note = note
+        self._judge_expire = now + (0.7 if result in (rhythm.PERFECT, rhythm.GOOD) else 0.95)
+        color = judge_flash(result)
+        if color is not None and note is not None:
+            self._flash[getattr(note, 'lane', 0)] = (now + 0.22, color)
+
+    def _finish_rhythm(self):
+        """整首走完：把还按着的结掉，算结算。"""
+        if self.mode != 'rhythm' or self.session is None or self._rhythm_done:
+            return
+        self._rhythm_done = True               # 先立旗子：后面 on_result 里发生什么都只算一次
+        for lane in list(self.session.open):
+            self.session.release(lane, self._t)
+        self.session.tick(self._t + 0.001)
+        self._armed.clear()
+        self._result = self.session.summary()
+        self.state = 'done'
+        self.update()
+        if callable(self.on_result):
+            try:
+                self.on_result(dict(self._result))
+            except Exception:
+                pass
+        self._fire_finish('done')
 
     def _read_keys(self):
         """哪几个键现在被按住（程序用 SendInput 弹的也算，按键状态一样会变）。"""
@@ -478,7 +693,22 @@ class FollowWindow(QWidget):
         return self.LEGEND_H + self.HEADER_H
 
     def _keys_top(self):
-        return self.height() - self.KEYS_H - 4
+        # 鼠标指示那条只在练习模式显示，窗口高度也跟着收 / 放，别在下面空一截
+        extra = (self.MOUSE_H + 6) if self._mouse_row() else 6
+        return self.height() - self.KEYS_H - extra
+
+    def _mouse_row(self):
+        """琴键下面那条「左 降调 / 中 升半音 / 右 升调」只在练习模式显示。"""
+        return self.mode == 'practice'
+
+    def _fit_row(self):
+        """按要不要显示鼠标指示条，把窗口高度收 / 放一下。"""
+        height = 470 + (self.MOUSE_H if self._mouse_row() else 0) + self.LEGEND_H
+        if self.height() == height:
+            return
+        self.setFixedSize(self.LANE_W * len(self.KEYS) + self.PAD * 2, height)
+        if self.isVisible():
+            self.apply_position()
 
     def _hit_line(self):
         """判定框底边：音符的头部走到这里就正好该按下去。"""
@@ -511,6 +741,8 @@ class FollowWindow(QWidget):
             painter.restore()
         self._paint_frame(painter)
         self._paint_keys(painter)
+        self._paint_mouse(painter)
+        self._paint_rhythm(painter)
         self._paint_header(painter)
         self._paint_legend(painter)
         painter.end()
@@ -525,6 +757,20 @@ class FollowWindow(QWidget):
         for lane in range(1, len(self.KEYS)):
             x = self._lane_x(lane)
             painter.drawLine(int(x), self._content_top(), int(x), int(self._hit_line()))
+        # 练习模式：把「现在该弹的那一列」的底色铺成**你现在按着的鼠标组合**的颜色
+        # （颜色表跟长条同一套）—— 一眼看出自己到底按了升调 / 升半音没有：
+        # 该按的记号在长条上写着，按没按对看这一列的背景色。
+        if self.paced and self.notes and self._wait_index < len(self.notes):
+            target = self.notes[self._wait_index]
+            if self._mouse in NOTE_COLORS and self._mouse:
+                tone = QColor(NOTE_COLORS[self._mouse][1])
+                rect = self._lane_rect(target.lane).adjusted(2, 0, -2, 0)
+                gradient = QLinearGradient(0, rect.top(), 0, rect.bottom())
+                gradient.setColorAt(0.0, QColor(tone.red(), tone.green(), tone.blue(), 22))
+                gradient.setColorAt(1.0, QColor(tone.red(), tone.green(), tone.blue(), 92))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(gradient))
+                painter.drawRoundedRect(rect, 9, 9)
         # 被按住 / 刚按对按错的列：整列透出一层它自己的颜色，越靠近判定框越亮
         for lane in range(len(self.KEYS)):
             color = self._active_color(lane)
@@ -629,6 +875,81 @@ class FollowWindow(QWidget):
             painter.drawText(rect.adjusted(6, 4, 0, 0),
                              Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, digit)
 
+    def _paint_mouse(self, painter):
+        """琴键下面那条：左 / 中 / 右三个鼠标键，按住哪个哪个亮（颜色跟长条一套）。"""
+        if not self._mouse_row():
+            return
+        top = self.height() - self.MOUSE_H - 4
+        height = self.MOUSE_H - 2
+        width = self.LANE_W + 8
+        gap = 8
+        total = width * len(MOUSE_BUTTONS) + gap * (len(MOUSE_BUTTONS) - 1)
+        x = (self.width() - total) / 2.0
+        font = QFont('Microsoft YaHei UI', 8)
+        hold = set(ch for ch in self._mouse)
+        for letter, short, long, _vk in MOUSE_BUTTONS:
+            rect = QRectF(x, top, width, height)
+            lit = letter in hold
+            tone = QColor(NOTE_COLORS.get(letter, NOTE_COLORS[''])[1])
+            if lit:
+                painter.setPen(QPen(QColor(tone.red(), tone.green(), tone.blue(), 235), 1.6))
+                painter.setBrush(QBrush(QColor(tone.red(), tone.green(), tone.blue(), 100)))
+            else:
+                painter.setPen(QPen(QColor(255, 255, 255, 34), 1))
+                painter.setBrush(QBrush(QColor(20, 26, 38, 175)))
+            painter.drawRoundedRect(rect, 7, 7)
+            painter.setFont(font)
+            painter.setPen(QColor(theme.c('#ffffff')) if lit else QColor(theme.c('#8b93a7')))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, '%s %s' % (short, long))
+            x += width + gap
+
+    def _badge_pixmap(self, kind):
+        """判定牌（缓存着，别每帧重画）。"""
+        pixmap = self._badges.get(kind)
+        if pixmap is None:
+            try:
+                pixmap = judgeicons.badge(kind, height=self.FRAME_H * 1.5)
+            except Exception:
+                return None
+            self._badges[kind] = pixmap
+        return pixmap
+
+    def _paint_rhythm(self, painter):
+        """音游叠在谱面上的东西：321 倒计时 / 连击数 / 最近一次判定。"""
+        if self.mode != 'rhythm':
+            return
+        area = QRectF(0, self._content_top(),
+                      self.width(), max(self._hit_line() - self._content_top(), 1))
+        if self.state == 'countdown' and self._countdown > 0:
+            count = int(math.ceil(self._countdown - 0.6))      # 最后 0.6 秒显示 GO
+            text = 'GO' if count <= 0 else str(count)
+            font = QFont('Microsoft YaHei UI', 44)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(QColor(0, 0, 0, 130))
+            painter.drawText(area.adjusted(2, 2, 2, 2), Qt.AlignmentFlag.AlignCenter, text)
+            painter.setPen(QColor(theme.c('#ffc247')))
+            painter.drawText(area, Qt.AlignmentFlag.AlignCenter, text)
+            return
+        combo = self.session.combo if self.session is not None else 0
+        if combo >= COMBO_SHOW:
+            font = QFont('Microsoft YaHei UI', 22)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(QColor(theme.c('#ffc247')))
+            painter.drawText(QRectF(self.PAD, self._content_top() - 4,
+                                    self.width() - self.PAD * 2 - 6, 30),
+                             Qt.AlignmentFlag.AlignRight, 'x%d' % combo)
+        now = time.perf_counter()
+        if self._judge and now < self._judge_expire:
+            pixmap = self._badge_pixmap(self._judge)
+            if pixmap is not None:
+                ratio = pixmap.devicePixelRatio() or 1.0
+                left = (self.width() - pixmap.width() / ratio) / 2.0
+                painter.setOpacity(max(0.0, min(1.0, (self._judge_expire - now) / 0.35)))
+                painter.drawPixmap(QPointF(left, self._hit_line() - 56), pixmap)
+                painter.setOpacity(1.0)
+
     def _paint_legend(self, painter):
         """
         最上面那条：一条细圆角色块 + 它代表的操作。
@@ -670,15 +991,22 @@ class FollowWindow(QWidget):
         painter.setPen(QColor(color))
         painter.drawText(QRectF(self.PAD, top, self.width() - self.PAD * 2, height),
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                         '跟奏 · ' + text)
+                         ('音游 · ' if self.mode == 'rhythm' else '跟奏 · ') + text)
         if self.notes:
-            done = (self._wait_index if self.paced
-                    else bisect_right(self._starts, max(self._t, 0.0)))
             painter.setFont(QFont('Microsoft YaHei UI', 9))
-            painter.setPen(QColor(theme.c('#8b93a7')))
-            painter.drawText(QRectF(self.PAD, top, self.width() - self.PAD * 2, height),
-                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                             '%d / %d' % (done, len(self.notes)))
+            if self.mode == 'rhythm' and self.session is not None:
+                painter.setPen(QColor(theme.c('#ffc247')))
+                painter.drawText(QRectF(self.PAD, top, self.width() - self.PAD * 2, height),
+                                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                                 '%d 分 · %d/%d' % (self.session.score,
+                                                    self.session.cursor, len(self.notes)))
+            else:
+                done = (self._wait_index if self.paced
+                        else bisect_right(self._starts, max(self._t, 0.0)))
+                painter.setPen(QColor(theme.c('#8b93a7')))
+                painter.drawText(QRectF(self.PAD, top, self.width() - self.PAD * 2, height),
+                                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                                 '%d / %d' % (done, len(self.notes)))
 
     def _glow_color(self, lane):
         """这一列现在（或刚刚）在弹的音是什么颜色，没有就用中性蓝。"""

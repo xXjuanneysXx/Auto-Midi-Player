@@ -130,6 +130,40 @@ def _draw_search(p, q, color):
     p.drawLine(q['QPointF'](14.7, 14.7), q['QPointF'](19.6, 19.6))
 
 
+def _draw_quickstart(p, q, color):
+    """快速上手：一本翻开的小书 + 一枚问号（「怎么用？」）。"""
+    pen = q['QPen'](color, 1.9)
+    pen.setCapStyle(q['Qt'].RoundCap)
+    pen.setJoinStyle(q['Qt'].RoundJoin)
+    p.setPen(pen)
+    p.setBrush(q['Qt'].NoBrush)
+    path = q['QPainterPath']()                  # 摊开的两页
+    path.moveTo(3.4, 5.6)
+    path.cubicTo(6.0, 4.2, 9.0, 4.2, 11.2, 6.0)
+    path.cubicTo(13.4, 4.2, 16.4, 4.2, 19.0, 5.6)
+    path.lineTo(19.0, 17.0)
+    path.cubicTo(16.4, 15.6, 13.4, 15.6, 11.2, 17.4)
+    path.cubicTo(9.0, 15.6, 6.0, 15.6, 3.4, 17.0)
+    path.closeSubpath()
+    p.drawPath(path)
+    p.drawLine(q['QPointF'](11.2, 6.0), q['QPointF'](11.2, 17.4))
+    pen2 = q['QPen'](q['QColor'](_contrast_hint(p)), 1.7)
+    pen2.setCapStyle(q['Qt'].RoundCap)
+    p.setPen(pen2)
+    p.setBrush(q['QBrush'](q['QColor'](_contrast_hint(p))))
+    p.drawEllipse(q['QPointF'](15.4, 11.2), 3.6, 3.6)       # 挖个底色的圆当问号的底
+    p.setPen(q['QPen'](color, 1.5))
+    p.setBrush(q['Qt'].NoBrush)
+    path2 = q['QPainterPath']()
+    path2.moveTo(14.0, 10.1)
+    path2.cubicTo(14.1, 9.0, 16.7, 9.0, 16.7, 10.4)
+    path2.cubicTo(16.7, 11.3, 15.4, 11.3, 15.4, 12.3)
+    p.drawPath(path2)
+    p.setPen(q['Qt'].NoPen)
+    p.setBrush(q['QBrush'](color))
+    p.drawEllipse(q['QPointF'](15.4, 13.6), 0.9, 0.9)
+
+
 # 眼睛那种「挖洞」没法真的挖（图标是透明的），所以拿一个和主色反着来的颜色顶上
 _hint = {'color': '#ffffff'}
 
@@ -152,6 +186,7 @@ DRAWERS = {
     'github': _draw_github,
     'reward': _draw_reward,
     'search': _draw_search,
+    'quickstart': _draw_quickstart,
 }
 
 SCALE = 3.0                     # 先在 3 倍尺寸上画，缩下来更干净

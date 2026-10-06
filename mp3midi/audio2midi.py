@@ -39,6 +39,7 @@ import math
 import os
 import sys
 import importlib
+import threading
 
 import numpy as np
 
@@ -278,9 +279,35 @@ def _try_import(name, error=None):
         return None
 
 
+_PROBE = {}
+_PROBE_LOCK = threading.Lock()
+
+
+def backend_probe(force=False):
+    """
+    三个后端现在能不能用，不能用的话带上原始异常信息。进程内只真探一次。
+
+    import 很贵（basic-pitch 那一串要一两秒），所以结果缓存下来；缓存失败原因
+    是为了出错上报 —— 打包版踩过一次「顶层包能 import、真干活时少个 dll 才炸」，
+    界面只显示「没装 basic-pitch」，光看那句话根本查不出来。
+    """
+    with _PROBE_LOCK:
+        if _PROBE and not force:
+            return dict((name, dict(info)) for name, info in _PROBE.items())
+        result = {'yin': {'ok': True, 'error': None}}     # 自带的，永远能用
+        for name, module in (('pyin', 'librosa'),
+                             ('basic-pitch', 'basic_pitch.inference')):
+            error = []
+            ok = _try_import(module, error) is not None
+            result[name] = {'ok': ok, 'error': (error[0] if error else None)}
+        _PROBE.clear()
+        _PROBE.update(result)
+        return dict((name, dict(info)) for name, info in result.items())
+
+
 def _has_pyin():
     """librosa 装了没有。"""
-    return _try_import('librosa') is not None
+    return bool(backend_probe().get('pyin', {}).get('ok'))
 
 
 def _has_basic_pitch():
@@ -289,14 +316,26 @@ def _has_basic_pitch():
 
     只 import 顶层包不够：真正干活的是 inference / note_creation，它们还要
     onnxruntime、scipy、numba 一大串。探得太浅就会出现「界面说能用、真转才报错」。
-    这一下要把整条链 import 进来（一两秒），所以只在后台线程里调。
+    这一下要把整条链 import 进来（一两秒），所以只在后台线程里调；结果由
+    backend_probe 缓存，同一次运行里不会反复 import。
     """
-    return _try_import('basic_pitch.inference') is not None
+    return bool(backend_probe().get('basic-pitch', {}).get('ok'))
 
 
 def describe_backends():
     """本机现在能用哪些后端（界面拿它显示提示）。"""
-    return {'yin': True, 'pyin': _has_pyin(), 'basic-pitch': _has_basic_pitch()}
+    return dict((name, info['ok']) for name, info in backend_probe().items())
+
+
+def probe_report():
+    """每个后端的探测结果拼成几行，失败带上原因 —— 给错误上报用。"""
+    lines = []
+    for name, info in backend_probe().items():
+        if info['ok']:
+            lines.append('%s：可用' % name)
+        else:
+            lines.append('%s：不可用（%s）' % (name, info['error'] or '原因不明'))
+    return '\n'.join(lines)
 
 
 def pyin_f0(path, sr=SR, progress=None):

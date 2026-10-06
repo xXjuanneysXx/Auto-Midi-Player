@@ -6,6 +6,7 @@
     python make_installer.py icon       # 只生成 AutoPlay.ico
     python make_installer.py app        # 只打两个版本的主程序
     python make_installer.py payload    # 只压 payload（需要主程序已经打好）
+    python make_installer.py online     # 只打「在线安装程序」（不挂 payload 的那个小 exe）
 
 全流程做四件事：
     1. 画一个 AutoPlay.ico（主程序和快捷方式都用它）；
@@ -16,8 +17,10 @@
        跟奏、简谱生成、演奏、试听、内置曲库都留着。
        打精简版时会临时把 edition.LITE 改成 True，打完立刻改回来。
     3. PyInstaller 打安装程序本体（--onefile）-> dist_installer\\；
-    4. 每个版本各压一个 payload.zip，追加到安装程序 exe 末尾，再补 16 字节尾巴
+    4. 每个版本各压一个 payload.zip，追加到安装程序 exe 末尾，再补 17 字节尾巴
        （魔数 + 偏移），产物放 发布\\，两个包大小明显不一样。
+    5. 顺手复制一份「在线安装程序」（安装程序本体，约 46 MB，不挂 payload）——
+       它启动后自己去拉 payload.json，把 make_parts.py 切好的片下下来装。
 
 第 3 步顺手也把卸载程序打出来（uninstall.py -> dist_installer\\uninstall.exe）：
 它跟着 payload 装到安装目录根上，用户从「设置 → 应用」点卸载走的就是它，
@@ -27,6 +30,7 @@
 import io
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -237,6 +241,22 @@ def build_installer():
     log('安装程序本体好了：%s' % INSTALLER_EXE)
 
 
+def build_online_installer():
+    """
+    在线安装程序：安装程序本体本身（不挂 payload，46 MB 左右）。
+
+    它启动时发现自己没带程序本体，就去曲库仓库拉 payload.json，把 make_parts.py
+    切好的片下下来再装 —— 百度网盘下载慢的用户用这个，先下 46 MB 就能开始。
+    """
+    if not os.path.isfile(INSTALLER_EXE):
+        build_installer()
+    os.makedirs(RELEASE_DIR, exist_ok=True)
+    out = os.path.join(RELEASE_DIR, 'AutoPlay 在线安装程序 v%s.exe' % app_version())
+    shutil.copy2(INSTALLER_EXE, out)
+    log('在线安装程序好了：%s（%.1f MB）' % (out, os.path.getsize(out) / 1048576.0))
+    return out
+
+
 def build_uninstaller():
     """卸载程序：装进安装目录的那个 uninstall.exe（纯标准库，比本体小得多）。"""
     if not os.path.isfile(ICON):
@@ -324,7 +344,7 @@ def build_payload(path, edition):
 
 
 def attach(payload, out):
-    """安装程序本体 + payload.zip + 16 字节尾巴 = 单文件安装包。"""
+    """安装程序本体 + payload.zip + 17 字节尾巴（9 字节魔数 + 8 字节偏移）= 单文件安装包。"""
     os.makedirs(os.path.dirname(out), exist_ok=True)
     offset = os.path.getsize(INSTALLER_EXE)
     with open(out, 'wb') as out_handle:
@@ -354,6 +374,17 @@ def main(argv):
     if 'icon' in steps:
         build_icon()
         return 0
+    if 'online' in steps and 'all' not in steps and 'app' not in steps:
+        build_icon()                     # 图标可能还没画（单独跑这一步时）
+        build_installer()
+        out = build_online_installer()
+        log('')
+        log('在线安装程序打好了。发它之前别忘了：')
+        log('  1. python -X utf8 make_parts.py          # 切片 + 写 曲库索引\\payload.json')
+        log('  2. python -X utf8 上传分片到Gitee.py      # 把片传到 Gitee Releases')
+        log('  3. 曲库索引\\payload.json 发到曲库仓库根目录')
+        log('    %s' % out)
+        return 0
     if 'all' in steps or 'app' in steps:
         build_icon()
         for edition in EDITIONS:
@@ -375,11 +406,14 @@ def main(argv):
                            % (edition['label'], app_version()))
         attach(payload, out)
         made.append(out)
+    online = build_online_installer()
     log('')
-    log('搞定。两个包都在 发布\\ 里，拷到别的电脑上双击就能装（那边不用装 Python）：')
+    log('搞定。都在 发布\\ 里，拷到别的电脑上双击就能装（那边不用装 Python）：')
     for path in made:
         log('    %s（%.1f MB）' % (os.path.basename(path),
                                  os.path.getsize(path) / 1048576.0))
+    log('    %s（%.1f MB，在线安装：先跑 make_parts.py 切片并上传到 Gitee Releases）'
+        % (os.path.basename(online), os.path.getsize(online) / 1048576.0))
     return 0
 
 

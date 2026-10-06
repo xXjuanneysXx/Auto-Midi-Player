@@ -12,8 +12,8 @@ AutoPlay 安装程序
 --------
 1. 先 PyInstaller --onefile 把本文件打成 `AutoPlay-安装程序.exe`；
 2. 再把整个程序（dist\\AutoPlay\\ 一整棵目录树 + songs\\）压成 payload.zip；
-3. 把 payload.zip 直接**追加**在这个 exe 的末尾，再补 16 字节尾巴
-   （8 字节魔数 + 8 字节 payload 起始偏移）。
+3. 把 payload.zip 直接**追加**在这个 exe 的末尾，再补 17 字节尾巴
+   （9 字节魔数 `APAYLOAD1` + 8 字节 payload 起始偏移）。
 
 运行时就用这个偏移把内嵌的 zip 当成普通文件读 —— 不用先把几百兆解到临时目录，
 装的时候是「从自己身上流式解压到目标目录」，又快又不占额外磁盘。
@@ -26,8 +26,23 @@ payload 里两棵树：
 
 app/ 里还带着打包好的卸载程序 uninstall.exe，装完就躺在安装目录根上；安装程序再往
 旁边写一份 uninstall.json，告诉它「装在哪、删哪些快捷方式、要不要取消 .mproj 关联」。
+
+在线安装（同一个源码的另一种用法）
+----------------------------------
+不带 payload 的「在线安装程序」只有 46 MB 左右，双击后它发现身边没有程序本体，
+就转去联网：
+
+    拉 payload.json（曲库仓库根目录）
+        -> 界面选完全版 / 精简版
+        -> 按清单把 32 MB 一片的程序本体下到 %LOCALAPPDATA%\\AutoPlay\\下载缓存\\
+        -> 用「多片拼起来的 zip 流」直接解压安装（不拼出大 zip）
+
+断点续传：下完的片校验 sha256 后跳过；下到一半的片带 HTTP Range 接着下；
+片挂在 Gitee Releases 上（单个附件上限 100 MB，所以切 32 MB，完全版 6 片、精简版 2 片）。
+清单和片都是 `make_parts.py` + `上传分片到Gitee.py` 产出的。
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -35,6 +50,9 @@ import struct
 import subprocess
 import sys
 import threading
+import time
+import urllib.error
+import urllib.request
 import winreg
 import zipfile
 
@@ -42,23 +60,23 @@ try:                                                  # 优先 Qt 官方绑定
     from PySide6.QtCore import Qt, Signal
     from PySide6.QtGui import (QBrush, QColor, QFont, QIcon, QPainter, QPen,
                                QPixmap)
-    from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QFrame,
-                                   QHBoxLayout, QLabel, QLineEdit, QProgressBar,
-                                   QPushButton, QVBoxLayout, QWidget)
+    from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
+                                   QFrame, QHBoxLayout, QLabel, QLineEdit,
+                                   QProgressBar, QPushButton, QVBoxLayout, QWidget)
 except ImportError:                                   # 装了 PyQt6 也行
     from PyQt6.QtCore import Qt, pyqtSignal as Signal
     from PyQt6.QtGui import (QBrush, QColor, QFont, QIcon, QPainter, QPen,
                              QPixmap)
-    from PyQt6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QFrame,
-                                 QHBoxLayout, QLabel, QLineEdit, QProgressBar,
-                                 QPushButton, QVBoxLayout, QWidget)
+    from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
+                                 QFrame, QHBoxLayout, QLabel, QLineEdit,
+                                 QProgressBar, QPushButton, QVBoxLayout, QWidget)
 
 
 import fileassoc                          # .mproj 文件关联（跟主程序共用同一份）
 
 APP_NAME = 'AutoPlay'
 APP_TITLE = 'MIDI 简谱自动演奏'
-APP_VERSION = '1.0.7'
+APP_VERSION = '1.1.0'
 APP_EXE = 'AutoPlay.exe'
 UNINSTALL_EXE = 'uninstall.exe'       # 打包时放进 payload，装完在安装目录根上
 UNINSTALL_JSON = 'uninstall.json'     # 安装时写，告诉上面那个 exe 该怎么卸
@@ -72,6 +90,18 @@ TRAILER_SIZE = len(PAYLOAD_MAGIC) + 8
 
 LOCALAPPDATA = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
 DEFAULT_DIR = os.path.join(LOCALAPPDATA, 'AutoPlay')
+
+# ---- 在线安装（这个 exe 里没有内嵌程序本体时用） ----
+# 清单（payload.json）跟 version.json / notice.json 一样放在曲库仓库根目录，
+# Gitee 的 raw 直链实测能读中文 json，不用走要令牌的 contents 接口。
+MANIFEST_URLS = (
+    'https://gitee.com/juanneys/midi-music/raw/master/payload.json',
+    'https://gitee.com/juanneys/midi-music/raw/main/payload.json',
+)
+DOWNLOAD_DIR = os.path.join(LOCALAPPDATA, 'AutoPlay', '下载缓存')
+NET_TIMEOUT = 20.0            # 单次请求超时（秒）—— 分片只有 32 MB，别等太久
+NET_RETRIES = 3               # 一片最多试几次（每次换一个地址 / 重试）
+USER_AGENT = 'AutoPlay-Installer/%s' % APP_VERSION
 
 # 两个版本：名字 / 目录 / 快捷方式 / 卸载表项都不一样，装在一起也不会互相打架。
 # make_installer.py 打包时往 payload 根上放一个 edition.txt 告诉安装程序这是哪一版。
@@ -229,6 +259,289 @@ def open_payload():
         raise RuntimeError('这个安装程序里没有内嵌的程序本体（payload.zip 丢了）。\n'
                            '请重新下载完整的安装包。')
     return zipfile.ZipFile(OffsetReader(open(path, 'rb'), offset)), path
+
+
+def has_embedded_payload():
+    """这个 exe 里带没带程序本体。没带 = 在线安装程序，得联网下分片。"""
+    return payload_source()[0] is not None
+
+
+# ============ 在线安装：拉清单 + 下分片 ============
+
+def _no_cache(url):
+    """给地址加个每次都变的参数 —— Gitee 的 raw 走 CDN，裸链接可能吐旧内容。"""
+    return '%s%s_=%d' % (url, '&' if '?' in url else '?', time.time())
+
+
+def _http_open(url, timeout=NET_TIMEOUT, start=None):
+    """
+    打开一个下载地址。start 不是 None 时带 `Range: bytes=<start>-`，
+    实现断点续传；服务器不认 Range（回 200）时调用方自己把多出来的那截丢掉。
+    """
+    headers = {'User-Agent': USER_AGENT}
+    if start:
+        headers['Range'] = 'bytes=%d-' % start
+    return urllib.request.urlopen(urllib.request.Request(url, headers=headers),
+                                  timeout=timeout)
+
+
+def _http_bytes(url, timeout=NET_TIMEOUT):
+    with _http_open(url, timeout=timeout) as response:
+        return response.read()
+
+
+def _duration(seconds):
+    """秒 -> `3 分 12 秒` 这种给人看的写法（剩余时间用）。"""
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return '%d 秒' % seconds
+    if seconds < 3600:
+        return '%d 分 %d 秒' % (seconds // 60, seconds % 60)
+    return '%d 小时 %d 分' % (seconds // 3600, (seconds % 3600) // 60)
+
+
+def fetch_manifest(timeout=NET_TIMEOUT):
+    """
+    拉在线安装清单（payload.json），返回 dict。
+
+    清单里写着每个版本的程序压成几片、每片多大、sha256 是多少、去哪儿下。
+    哪个地址都拉不到就报错，让用户换回百度网盘那份完整安装包。
+    """
+    problems = []
+    for url in manifest_urls():
+        try:
+            data = json.loads(_http_bytes(_no_cache(url), timeout).decode('utf-8', 'replace'))
+            if isinstance(data, dict) and data.get('editions'):
+                return data
+            problems.append('%s：内容不对（没有 editions）' % url)
+        except Exception as exc:
+            problems.append('%s：%s' % (url, exc))
+    raise RuntimeError('拉不到在线安装清单（payload.json）：\n\n%s\n\n'
+                       '请检查网络连接；实在连不上就改用百度网盘那份完整安装包。'
+                       % '\n'.join(problems))
+
+
+def manifest_urls():
+    """
+    清单地址：环境变量 `AUTOPLAY_PAYLOAD_INDEX` 指哪个就用哪个（调试、或以后换镜像
+    地址时不用重新打包），没设就用代码里内置的那两个。
+    """
+    override = str(os.environ.get('AUTOPLAY_PAYLOAD_INDEX') or '').strip()
+    return (override,) if override else MANIFEST_URLS
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        while True:
+            blob = handle.read(1 << 20)
+            if not blob:
+                break
+            digest.update(blob)
+    return digest.hexdigest()
+
+
+class PartsReader:
+    """
+    把下载好的多片 zip 拼成一个能随机读的只读文件对象。
+
+    zipfile 要 seek 到末尾读「中央目录」，所以这个壳子必须支持 seek ——
+    有了它就不用先把 175 MB 的片拼成一个大 zip（省磁盘、省时间）。
+    """
+
+    def __init__(self, paths):
+        self.handles = [open(path, 'rb') for path in paths]
+        self.sizes = [os.fstat(handle.fileno()).st_size for handle in self.handles]
+        self.offsets = []
+        length = 0
+        for size in self.sizes:
+            self.offsets.append(length)
+            length += size
+        self.length = length
+        self.pos = 0
+
+    def _which(self, pos):
+        index = 0
+        for i, offset in enumerate(self.offsets):
+            if pos >= offset:
+                index = i
+        return index
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = self.length - self.pos
+        out = bytearray()
+        while size > 0 and self.pos < self.length:
+            index = self._which(self.pos)
+            handle = self.handles[index]
+            handle.seek(self.pos - self.offsets[index])
+            blob = handle.read(size)
+            if not blob:
+                break
+            out += blob
+            self.pos += len(blob)
+            size -= len(blob)
+        return bytes(out)
+
+    def seek(self, pos, whence=0):
+        if whence == 0:
+            target = pos
+        elif whence == 1:
+            target = self.pos + pos
+        else:
+            target = self.length + pos
+        self.pos = max(0, min(self.length, target))
+        return self.pos
+
+    def tell(self):
+        return self.pos
+
+    def seekable(self):
+        return True
+
+    def readable(self):
+        return True
+
+    def close(self):
+        for handle in self.handles:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+
+class PartsDownloader:
+    """
+    把清单里某一版的切片下到本地缓存目录，返回一个拼好的 PartsReader。
+
+    断点续传做两层：
+      · 整片已经下完（大小 + sha256 都对）—— 直接跳过，程序关掉再开接着用；
+      · 下到一半（文件在、大小不够）—— 带 HTTP Range 接着下，不从头再来。
+    下完的片**留着不删**（在 %LOCALAPPDATA%\\AutoPlay\\下载缓存\\<版本> 里），
+    重装 / 换版本都能接着用。哪片失败最多试 NET_RETRIES 次，每次换一个镜像地址。
+    """
+
+    def __init__(self, manifest, edition_key, report):
+        self.manifest = manifest
+        self.key = edition_key
+        self.info = (manifest.get('editions') or {}).get(edition_key)
+        if not self.info:
+            raise RuntimeError('这份在线安装清单里没有「%s」这个版本，'
+                               '可能清单刚更新过，请重新下载在线安装程序。' % edition_key)
+        self.report = report
+        self.cache = os.path.join(DOWNLOAD_DIR, edition_key,
+                                  str(manifest.get('app_version') or 'unknown'))
+        self.started = time.time()
+
+    def total_download(self):
+        return sum(int(part['size']) for part in self.info.get('parts') or [])
+
+    def run(self):
+        os.makedirs(self.cache, exist_ok=True)
+        parts = self.info.get('parts') or []
+        if not parts:
+            raise RuntimeError('这份清单里「%s」没有切片，装不了' % self.key)
+        total = self.total_download() or 1
+        done = 0
+        paths = []
+        for index, part in enumerate(parts, 1):
+            path = os.path.join(self.cache, part['name'])
+            self._ensure(index, len(parts), part, path, done, total)
+            paths.append(path)
+            done += int(part['size'])
+        self.report('下载完成，开始安装…', done, done)
+        return PartsReader(paths)
+
+    def _urls_for(self, name):
+        urls = ['%s/%s' % (str(base).rstrip('/'), name)
+                for base in (self.info.get('base_urls') or [])]
+        for mirror in (self.manifest.get('mirrors') or []):
+            urls.append('%s/%s' % (str(mirror).rstrip('/'), name))
+        if not urls:
+            raise RuntimeError('这份清单里没有下载地址（base_urls 是空的）')
+        return urls
+
+    def _ensure(self, index, count, part, path, done, total):
+        name = part['name']
+        size = int(part['size'])
+        digest = str(part.get('sha256') or '')
+        if os.path.isfile(path):
+            have = os.path.getsize(path)
+            if have == size and (not digest or sha256_file(path) == digest):
+                self.report('第 %d/%d 片已经下过了，跳过' % (index, count),
+                            done + size, total)
+                return
+            if have > size:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        urls = self._urls_for(name)
+        last = ''
+        for attempt in range(1, NET_RETRIES + 1):
+            url = urls[(attempt - 1) % len(urls)]
+            try:
+                self._fetch(index, count, part, path, url, done, total)
+                return
+            except Exception as exc:
+                last = str(exc)
+                if attempt < NET_RETRIES:
+                    self.report('第 %d/%d 片没下成（%s），换源重试…' % (index, count, last),
+                                done, total)
+        raise RuntimeError('下载第 %d/%d 片失败：%s\n\n%s\n\n'
+                           '可以重开这个安装程序接着下（已经下好的片会跳过），'
+                           '或者改用百度网盘那份完整安装包。' % (index, count, last, name))
+
+    def _fetch(self, index, count, part, path, url, done, total):
+        name = part['name']
+        size = int(part['size'])
+        digest = str(part.get('sha256') or '')
+        received = os.path.getsize(path) if os.path.isfile(path) else 0
+        if received >= size:
+            received = 0
+        with open(path, 'ab' if received else 'wb') as out:
+            while received < size:
+                before = received
+                response = _http_open(url, NET_TIMEOUT, start=received or None)
+                with response:
+                    skip = 0
+                    if received and getattr(response, 'status', 200) != 206:
+                        skip = received          # 服务器不认 Range：把重给的前半截丢掉
+                    while True:
+                        blob = response.read(1 << 18)
+                        if not blob:
+                            break
+                        if skip:
+                            if len(blob) <= skip:
+                                skip -= len(blob)
+                                continue
+                            blob = blob[skip:]
+                            skip = 0
+                        out.write(blob)
+                        received += len(blob)
+                        self._tick(index, count, name, received, size, done, total)
+                out.flush()
+                if received == before:
+                    raise RuntimeError('对方提前断开了（下到 %d 字节）' % received)
+        if received != size:
+            raise RuntimeError('大小不对：下到 %d 字节，应该是 %d' % (received, size))
+        if digest and sha256_file(path) != digest:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise RuntimeError('这一片下坏了（sha256 对不上），已经删掉，下次重下')
+
+    def _tick(self, index, count, name, received, size, done, total):
+        downloaded = done + received
+        elapsed = max(0.001, time.time() - self.started)
+        speed = downloaded / elapsed
+        eta = (total - downloaded) / speed if speed > 0 else 0
+        self.report('正在下载：第 %d/%d 片 %s · %.1f MB/s · 还剩约 %s'
+                    % (index, count, name, speed / 1048576.0, _duration(eta)),
+                    downloaded, total)
+
+
 def format_size(size):
     """字节 -> `123 MB` 这种给人看的写法。"""
     size = float(size)
@@ -381,8 +694,13 @@ class Installer:
     """真正干活的：解压 -> 建快捷方式 -> 写卸载信息。全在后台线程里跑。"""
 
     def __init__(self, options, report):
-        self.options = options          # {'dir':…, 'desktop':bool, 'startmenu':bool}
+        self.options = options          # {'dir':…, 'desktop':bool, 'startmenu':bool,
+                                        #  'online':bool, 'edition':…, 'manifest':…}
         self.report = report            # report(在干嘛, 已完成字节, 总字节)
+        self.total_bytes = 0            # 在线安装：下载 + 解压的总字节（进度条按它走）
+        self.offset_bytes = 0           # 当前阶段开始前已经完成的字节
+        self.last_progress = None       # 最近一次报的 (已完成, 总字节)
+        self.reader = None              # 在线安装：多片拼起来的那个文件对象
 
     def run(self):
         target = self.options['dir']
@@ -390,22 +708,74 @@ class Installer:
         os.makedirs(target, exist_ok=True)
         self._check_writable(target)
 
-        payload, _path = open_payload()
-        with payload:
-            self._check_payload(payload)
-            self._extract(payload, target)
+        if self.options.get('online'):
+            payload = self._online_payload()          # 联网下分片，拼成 zip 流
+        else:
+            payload, _path = open_payload()           # 内嵌的 payload.zip
+        try:
+            with payload:
+                self._check_payload(payload)
+                self._extract(payload, target)
+        finally:                          # zipfile 不会替我们关掉传进去的文件对象
+            if self.reader is not None:
+                self.reader.close()
+                self.reader = None
         self._clean_old(target)
 
-        self.report('写说明文件…', 1, 1)
+        self._stage('写说明文件…')
         self._write_readme(target)
         shortcuts = self._shortcuts(target)
         assoc = self._register_assoc(target) if self.options.get('assoc') else ''
-        self.report('写入卸载信息…', 1, 1)
+        self._stage('写入卸载信息…')
         size_kb = self._dir_size(target) / 1024.0
         uninstaller = make_uninstaller(target, shortcuts, assoc=bool(assoc))
         register_uninstall(target, uninstaller, size_kb)
-        self.report('装好了', 1, 1)
+        self._stage('装好了')
         return target
+
+    def _online_payload(self):
+        """
+        在线安装：先下分片，再把「多片拼起来的 zip」交给解压那一步。
+
+        不拼出完整的大 zip 文件 —— PartsReader 直接从几个片里按需读，
+        省磁盘也省一次全量拷贝。
+        """
+        manifest = self.options.get('manifest') or fetch_manifest()
+        key = self.options.get('edition') or 'full'
+        info = (manifest.get('editions') or {}).get(key) or {}
+        download_total = sum(int(part['size']) for part in info.get('parts') or [])
+        install_total = int(info.get('install_size') or 0) or int(info.get('size') or 0) * 3
+        self.total_bytes = max(1, download_total + install_total)
+        self.offset_bytes = 0
+        downloader = PartsDownloader(manifest, key, self._download_report)
+        reader = downloader.run()
+        self.reader = reader
+        self.offset_bytes = download_total
+        self.report('下载完成，开始解压安装…', self.offset_bytes, self.total_bytes)
+        return zipfile.ZipFile(reader)
+
+    def _download_report(self, text, done, total):
+        self.report(text, min(int(done), self.total_bytes), self.total_bytes)
+
+    def _stage(self, text):
+        """
+        收尾阶段的提示（写说明 / 建快捷方式 / 写卸载信息 / 装好了）。
+
+        让进度条停在刚才的位置 —— 在线安装就是 100%。以前这里固定报 (1, 1)，
+        进度条走到头又缩回 0.1%，看着像出了错。
+        """
+        if self.total_bytes:
+            self.report(text, self.total_bytes, self.total_bytes)
+        else:
+            self.report(text, *(self.last_progress or (1, 1)))
+
+    def _tick(self, text, done, total):
+        """解压阶段的进度：在线安装时接到下载阶段后面；离线安装就用原来的总数。"""
+        if self.total_bytes:
+            self.last_progress = (self.offset_bytes + done, self.total_bytes)
+        else:
+            self.last_progress = (done, total)
+        self.report(text, *self.last_progress)
 
     def _register_assoc(self, target):
         """
@@ -418,10 +788,10 @@ class Installer:
         try:
             fileassoc.register(exe, notify=False)
             fileassoc.notify_shell()
-            self.report('关联 .mproj 工程文件：双击就直接打开编辑器', 1, 1)
+            self._stage('关联 .mproj 工程文件：双击就直接打开编辑器')
             return exe
         except Exception as exc:
-            self.report('关联 .mproj 没成功（不影响使用）：%s' % exc, 1, 1)
+            self._stage('关联 .mproj 没成功（不影响使用）：%s' % exc)
             return ''
 
     @staticmethod
@@ -509,7 +879,7 @@ AutoPlayUpdater.exe  增量更新时换文件用的小程序（平时不用管�
 卸载
 ----
 设置 →「应用」里搜 AutoPlay，或者双击安装目录里的 uninstall.exe。
-卸载只删程序本体和快捷方式，%%LOCALAPPDATA%%\AutoPlay 里的设置 / 日志 / 录制 /
+卸载只删程序本体和快捷方式，%%LOCALAPPDATA%%\\AutoPlay 里的设置 / 日志 / 录制 /
 谱面都留着 —— 重新装回来还认得你。
 """ % (APP_TITLE, APP_VERSION, EDITION_LABEL,
                 '=' * (len(APP_TITLE) + len(APP_VERSION) + len(EDITION_LABEL) + 5))
@@ -568,7 +938,9 @@ AutoPlayUpdater.exe  增量更新时换文件用的小程序（平时不用管�
             if not subs or subs.startswith('/') or '..' in subs.split('/'):
                 continue
             entries.append((info, subs))
-        total = sum(info.file_size for _info, _subs in entries) or 1
+        # 注意：这里必须用循环变量 item，不能用外面那个 info（循环结束后它停在最后
+        # 一个条目上，算出来的总量会小得离谱 —— 进度条就会乱跳）
+        total = sum(item.file_size for item, _subs in entries) or 1
         done = 0
         for info, subs in entries:
             dest = os.path.join(target, *subs.split('/'))
@@ -582,7 +954,7 @@ AutoPlayUpdater.exe  增量更新时换文件用的小程序（平时不用管�
                         break
                     out.write(chunk)
                     done += len(chunk)
-                    self.report('正在安装：%s' % subs, done, total)
+                    self._tick('正在安装：%s' % subs, done, total)
         return done
 
     def _shortcuts(self, target):
@@ -598,14 +970,14 @@ AutoPlayUpdater.exe  增量更新时换文件用的小程序（平时不用管�
         if self.options.get('startmenu'):
             wanted.append(os.path.join(start_menu_dir(), SHORTCUT_NAME + '.lnk'))
         for link in wanted:
-            self.report('创建快捷方式：%s' % link, 1, 1)
+            self._stage('创建快捷方式：%s' % link)
             try:
                 os.makedirs(os.path.dirname(link), exist_ok=True)
                 make_shortcut(link, exe, target, icon, APP_TITLE)
                 made.append(link)
-                self.report('快捷方式好了：%s' % link, 1, 1)
+                self._stage('快捷方式好了：%s' % link)
             except Exception as exc:      # 快捷方式建不上不该让整个安装失败
-                self.report('快捷方式没建成（%s）：%s' % (os.path.basename(link), exc), 1, 1)
+                self._stage('快捷方式没建成（%s）：%s' % (os.path.basename(link), exc))
         return made
 
     @staticmethod
@@ -627,9 +999,13 @@ class InstallerWindow(QWidget):
 
     on_progress = Signal(str, int, int)     # 后台线程 -> 界面
     on_done = Signal(bool, str)
+    on_manifest = Signal(object)            # 在线安装清单（dict，或者 Exception）
 
-    def __init__(self):
+    def __init__(self, online=None):
         super().__init__()
+        # 没有内嵌程序本体 = 在线安装程序；也可以在命令行加 --online 强制试这一套
+        self.online = (not has_embedded_payload()) if online is None else bool(online)
+        self.manifest = None
         self.setWindowTitle('%s 安装程序 v%s' % (APP_TITLE, APP_VERSION))
         self.setMinimumWidth(620)
         self.setStyleSheet(STYLE)
@@ -639,8 +1015,14 @@ class InstallerWindow(QWidget):
         self._build()
         self.on_progress.connect(self._show_progress)
         self.on_done.connect(self._show_result)
+        self.on_manifest.connect(self._show_manifest)
         self.on_progress.emit('', 0, 1)
         self._load_payload_info()
+
+    def _subtitle_text(self):
+        tail = ('程序本体联网下载，支持断点续传' if self.online
+                else '自带运行环境，目标电脑不需要装 Python，装完就能用')
+        return 'v%s · %s · %s' % (APP_VERSION, EDITION_LABEL, tail)
 
     # ---- 界面 ----
 
@@ -652,8 +1034,7 @@ class InstallerWindow(QWidget):
         self.title = QLabel('安装 %s' % APP_TITLE)
         self.title.setObjectName('title')
         root.addWidget(self.title)
-        self.subtitle = QLabel('v%s · %s · 自带运行环境，目标电脑不需要装 Python，装完就能用'
-                               % (APP_VERSION, EDITION_LABEL))
+        self.subtitle = QLabel(self._subtitle_text())
         self.subtitle.setObjectName('subtitle')
         root.addWidget(self.subtitle)
 
@@ -675,6 +1056,15 @@ class InstallerWindow(QWidget):
 
     def _build_options(self):
         self.options_page, box = self._card()
+
+        self.edition_combo = None
+        if self.online:                # 在线安装：装哪一版由用户在这儿选
+            box.addWidget(self._label('安装版本'))
+            self.edition_combo = QComboBox()
+            self.edition_combo.addItem('完全版 · 全部功能（含音频转 MIDI、简谱编辑器）', 'full')
+            self.edition_combo.addItem('精简版 · 不含音频转 MIDI 和编辑器，体积小', 'lite')
+            self.edition_combo.currentIndexChanged.connect(self._edition_changed)
+            box.addWidget(self.edition_combo)
 
         box.addWidget(self._label('安装位置'))
         row = QHBoxLayout()
@@ -715,6 +1105,7 @@ class InstallerWindow(QWidget):
 
         self.space_label = QLabel('')
         self.space_label.setObjectName('value')
+        self.space_label.setWordWrap(True)
         box.addWidget(self.space_label)
         box.addStretch(1)
 
@@ -730,6 +1121,21 @@ class InstallerWindow(QWidget):
         buttons.addWidget(self.install_button)
         box.addLayout(buttons)
         return self.options_page
+
+    def _edition_changed(self, _index=None):
+        """在线安装：换版本时界面上的名字 / 默认目录 / 快捷方式名都跟着换。"""
+        key = self.edition_combo.currentData() if self.edition_combo else 'full'
+        current = os.path.normpath(self.dir_edit.text().strip() or '')
+        was_default = (not current) or current == os.path.normpath(DEFAULT_DIR)
+        apply_edition(key)
+        if was_default:                # 没手动改过目录就跟着换成那一版的默认目录
+            self.dir_edit.setText(DEFAULT_DIR)
+        self.title.setText('安装 %s' % APP_TITLE)
+        self.subtitle.setText(self._subtitle_text())
+        self.setWindowTitle('%s 安装程序 v%s' % (APP_TITLE, APP_VERSION))
+        if self.assoc_box is not None:
+            self.assoc_box.setVisible(HAS_ASSOC)    # 精简版没有编辑器，藏起来
+        self._refresh_space()
 
     def _build_progress(self):
         self.progress_page, box = self._card()
@@ -786,7 +1192,12 @@ class InstallerWindow(QWidget):
     # ---- 干活 ----
 
     def _load_payload_info(self):
-        """看一眼内嵌的程序本体有多大，顺便把「要多少空间」显示出来。"""
+        """看一眼程序本体有多大，顺便把「要多少空间 / 要下多少」显示出来。"""
+        if self.online:
+            self.payload_bytes = 0
+            self.space_label.setText('正在拉在线安装清单…')
+            threading.Thread(target=self._load_manifest, daemon=True).start()
+            return
         try:
             payload, _path = open_payload()
         except Exception as exc:
@@ -798,7 +1209,28 @@ class InstallerWindow(QWidget):
             self.payload_bytes = sum(info.file_size for info in payload.infolist())
         self._refresh_space()
 
+    def _load_manifest(self):
+        """后台线程：拉在线安装清单（payload.json）。"""
+        try:
+            data = fetch_manifest()
+        except Exception as exc:
+            self.on_manifest.emit(exc)
+            return
+        self.on_manifest.emit(data)
+
+    def _show_manifest(self, data):
+        if isinstance(data, Exception):
+            self.space_label.setText(
+                '暂时拉不到在线安装清单，点「开始安装」会再试一次；'
+                '实在连不上就改用百度网盘那份完整安装包。\n\n%s' % data)
+            return
+        self.manifest = data
+        self._refresh_space()
+
     def _refresh_space(self):
+        if self.online:
+            self._refresh_online_space()
+            return
         if not self.payload_bytes:
             return
         text = '需要 %s' % format_size(self.payload_bytes)
@@ -807,6 +1239,30 @@ class InstallerWindow(QWidget):
             text += ' · 这个盘还剩 %s' % format_size(free)
             if free < self.payload_bytes * 1.05:
                 text += ' · 空间可能不够'
+        self.space_label.setText(text)
+
+    def _refresh_online_space(self):
+        """在线安装：列出「要下多少、几片、安装后多大」，清单还没拉到时什么都不说。"""
+        key = self.edition_combo.currentData() if self.edition_combo else 'full'
+        info = ((self.manifest or {}).get('editions') or {}).get(key) or {}
+        if not info:
+            if self.manifest is not None:
+                self.space_label.setText('这份在线清单里没有「%s」，换一个版本试试' % EDITION_LABEL)
+            return
+        size = int(info.get('size') or 0)
+        install = int(info.get('install_size') or 0)
+        text = '要下载 %s（%d 片）' % (format_size(size), len(info.get('parts') or []))
+        if install:
+            text += ' · 安装后约 %s' % format_size(install)
+        free = free_space(self.dir_edit.text().strip() or DEFAULT_DIR)
+        if free:
+            text += ' · 这个盘还剩 %s' % format_size(free)
+            if install and free < install * 1.05:
+                text += ' · 空间可能不够'
+        version = (self.manifest or {}).get('app_version')
+        if version and version != APP_VERSION:
+            text += ' · 清单里是最新的 v%s' % version
+        text += '\n下好的分片会留着，断了重开接着下，不会重下。'
         self.space_label.setText(text)
 
     def _browse(self):
@@ -823,16 +1279,27 @@ class InstallerWindow(QWidget):
         self.target = target
         self.options_page.setVisible(False)
         self.progress_page.setVisible(True)
-        self.title.setText('正在安装')
-        self.subtitle.setText('别关这个窗口，装完会自己跳转')
         options = {'dir': target,
                    'desktop': self.desktop_box.isChecked(),
                    'startmenu': self.startmenu_box.isChecked(),
                    'assoc': bool(self.assoc_box is not None and self.assoc_box.isChecked())}
+        if self.online:
+            options['online'] = True
+            options['edition'] = (self.edition_combo.currentData()
+                                  if self.edition_combo else 'full')
+            options['manifest'] = self.manifest      # 可能还没拉到，后台线程会再试
+            self.title.setText('正在下载并安装')
+            self.progress_title.setText('正在下载程序本体…')
+            self.subtitle.setText('中途关掉也没事，下次重开会接着下（断点续传）')
+        else:
+            self.title.setText('正在安装')
+            self.subtitle.setText('别关这个窗口，装完会自己跳转')
         threading.Thread(target=self._install, args=(options,), daemon=True).start()
 
     def _install(self, options):
         try:
+            if options.get('online') and not options.get('manifest'):
+                options['manifest'] = fetch_manifest()   # 界面上没拉到，这儿再试一次
             target = Installer(options, self._emit).run()
         except Exception as exc:
             self.on_done.emit(False, str(exc))
@@ -901,11 +1368,17 @@ from noteicon import make_icon            # 跟主程序同一个图标
 
 def main(argv=None):
     argv = list(sys.argv if argv is None else argv)
-    apply_edition(read_edition())        # 完全版还是精简版，看内嵌的 payload
+    forced = '--online' in argv          # 调试用：源码直接跑 / 想看下载那套界面
+    argv = [item for item in argv if item != '--online']
+    online = forced or not has_embedded_payload()
+    if online:
+        apply_edition('full')            # 在线版：装哪一版由界面上的下拉框选
+    else:
+        apply_edition(read_edition())    # 离线版：完全版还是精简版，看内嵌的 payload
     app = QApplication(argv)
     app.setApplicationName(APP_TITLE + ' 安装程序')
     app.setStyle('Fusion')
-    window = InstallerWindow()
+    window = InstallerWindow(online=online)
     window.show()
     return app.exec()
 

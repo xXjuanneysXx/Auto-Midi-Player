@@ -1,0 +1,10 @@
+{
+  "format": "autoplay-rhythm",
+  "enabled": true,
+  "site": "gitee",
+  "owner": "juanneys",
+  "repo": "midi-music",
+  "branch": "master",
+  "dir": "音游记录",
+  "note": "音游模式成绩：一条一个 json，按曲子放在 音游记录/<曲名>/ 下面"
+}

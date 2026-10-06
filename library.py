@@ -119,8 +119,11 @@ HIDDEN_SONGS = ('邓垚 - 诀别书',)
 # 正常它们不会出现在 library.json 的 songs 里，但万一手滑写进去，这里兜一层：
 # 别把 error_report.json 这种配置当成曲子解析出来。
 META_FILES = ('library.json', 'notice.json', 'version.json', 'update.json',
-              'themes.json', 'error_report.json')
+              'themes.json', 'error_report.json', 'rhythm.json', 'payload.json')
 ERROR_REPORT_DIR = '错误报告'
+RHYTHM_DIR = '音游记录'          # 音游成绩（一条一个 json）
+MANUAL_DIR = '快速上手'          # 程序内「快速上手」手册（md）
+MANIFEST_DIR = 'manifests'       # 每一版的文件清单（发版留档，客户端不读）
 
 
 def is_meta_path(path):
@@ -130,7 +133,9 @@ def is_meta_path(path):
         return True
     if text.rsplit('/', 1)[-1] in META_FILES:
         return True
-    return ERROR_REPORT_DIR in text
+    # 这几个目录里的东西也一律不是曲子：错误报告 / 音游成绩 / 快速上手手册
+    return any(folder in text for folder in (ERROR_REPORT_DIR, RHYTHM_DIR, MANUAL_DIR,
+                                             MANIFEST_DIR))
 
 
 def is_hidden(song):
@@ -904,6 +909,62 @@ def repo_files(site, owner, repo, ref, token='', timeout=API_TIMEOUT):
         out.append({'path': name, 'size': int(item.get('size') or 0),
                     'sha': str(item.get('sha') or '')})
     return out, ''
+
+
+def list_dir(site, owner, repo, path, token='', branch='', timeout=API_TIMEOUT):
+    """
+    列出仓库里某个目录的文件（contents 接口）。
+
+    返回 ([{path, size, sha, url}, ...], 出错信息)。目录不存在（Gitee 回空数组、
+    GitHub 回 404）都当「空目录」，不算错 —— 音游成绩那种目录一开始就是空的。
+
+    注意：Gitee 这个接口匿名调用会 403，必须带令牌。
+    """
+    url = _contents_url(site, owner, repo, path, branch)
+    data, code, why = _api_raw(url, token, timeout=timeout, site=site)
+    if code == 404:
+        return [], ''
+    if data is None:
+        return [], why
+    if isinstance(data, dict):                     # 给的是单个文件
+        items = [data]
+    elif isinstance(data, list):
+        items = data
+    else:
+        return [], '文件列表看不懂（%s）' % path
+    out = []
+    for item in items:
+        if not isinstance(item, dict) or item.get('type') not in (None, 'file', 'blob'):
+            continue
+        name = str(item.get('path') or item.get('name') or '')
+        if not name:
+            continue
+        out.append({'path': name,
+                    'size': int(item.get('size') or 0),
+                    'sha': str(item.get('sha') or ''),
+                    'url': str(item.get('download_url') or '')})
+    return out, ''
+
+
+def read_text_file(site, owner, repo, path, token='', branch='', timeout=API_TIMEOUT):
+    """
+    读仓库里一个文本文件（contents 接口，拿 base64 再解）。
+
+    为什么不用 raw 直链：Gitee 的 raw 对中文文本会过内容审核（回 451）——
+    音游成绩里带着用户填的中文名字，走 raw 十有八九读不回来。
+    """
+    url = _contents_url(site, owner, repo, path, branch)
+    data, code, why = _api_raw(url, token, timeout=timeout, site=site)
+    if isinstance(data, dict) and data.get('content'):
+        try:
+            return base64.b64decode(data['content']).decode('utf-8', 'replace'), ''
+        except Exception as exc:
+            return '', '内容解不开：%s' % exc
+    if code == 404:
+        return '', '仓库里没有 %s' % path
+    if isinstance(data, list):
+        return '', '%s 是个目录' % path
+    return '', why or ('读不到 %s' % path)
 
 
 def is_midi(path):
